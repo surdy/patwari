@@ -1,14 +1,14 @@
-# Khata
+# Patwari
 
-Khata is a self-hosted archive for complete coding-agent sessions.
+Patwari is a self-hosted archive for complete coding-agent sessions.
 
-**Munshi writes the record; Khata keeps the archive.**
+**Munshi writes the record; Patwari keeps the archive.**
 
 Munshi captures session files on developer machines, compresses them, and uploads immutable
-snapshots to Khata. Notesmith remains the home for human-readable summaries. A Notesmith summary
-may reference its Khata session ID when full context is needed.
+snapshots to Patwari. Notesmith remains the home for human-readable summaries. A Notesmith summary
+may reference its Patwari session ID when full context is needed.
 
-Khata is designed primarily for programmatic use:
+Patwari is designed primarily for programmatic use:
 
 - reliable archival of complete session transcripts and related source files;
 - retrieval of original artifacts for inspection or future restoration;
@@ -20,7 +20,7 @@ Khata is designed primarily for programmatic use:
 | Area | Decision |
 | --- | --- |
 | Purpose | Archive complete coding-agent sessions |
-| Summaries | Remain in Notesmith; Khata does not store them |
+| Summaries | Remain in Notesmith; Patwari does not store them |
 | User interface | API and CLI integrations only; no web UI in v1 |
 | Artifact visibility | Server-readable compressed files |
 | Encryption | No application-level encryption initially |
@@ -28,7 +28,7 @@ Khata is designed primarily for programmatic use:
 | Initial deployment | Single-user Podman Quadlet on quadhost |
 | Metadata store | SQLite |
 | Blob store | Dedicated local filesystem volume |
-| Additional backups | Managed outside Khata at the filesystem/host level |
+| Additional backups | Managed outside Patwari at the filesystem/host level |
 | Archive representation | Versioned manifest plus individually compressed files |
 | Source cleanup | Manual, previewable Munshi command only |
 | Initial source | GitHub Copilot CLI through Munshi |
@@ -48,7 +48,7 @@ Khata is designed primarily for programmatic use:
 
 - Storing or rendering Markdown summaries.
 - Replacing Notesmith as the knowledge store.
-- Searching transcript contents inside Khata.
+- Searching transcript contents inside Patwari.
 - Generating learnings, patterns, or skills inside the server.
 - Restoring sessions into an installed coding agent.
 - Automatically deleting source sessions.
@@ -57,7 +57,7 @@ Khata is designed primarily for programmatic use:
 - Client-side encryption.
 - PostgreSQL, S3, or distributed operation.
 
-Khata supplies archives to future analysis tools; it does not become an agent or knowledge
+Patwari supplies archives to future analysis tools; it does not become an agent or knowledge
 extraction system itself.
 
 ## Responsibility boundary
@@ -70,12 +70,12 @@ extraction system itself.
 - Compresses each artifact, initially with Zstandard.
 - Computes checksums and creates the versioned manifest.
 - Uploads or resumes the snapshot.
-- Records Khata IDs and archival receipts.
+- Records Patwari IDs and archival receipts.
 - Downloads, decompresses, and interprets artifacts.
 - Eventually performs agent-specific restore validation.
 - Offers a manual, previewable prune command after successful archival.
 
-### Khata
+### Patwari
 
 - Owns remote session and snapshot identity.
 - Validates manifests and upload state.
@@ -90,8 +90,8 @@ extraction system itself.
 ### Notesmith
 
 - Stores the latest curated Markdown summary.
-- May include a `khata_session_id`, snapshot ID, or stable Khata URI.
-- Is not a runtime dependency of Khata.
+- May include a `patwari_session_id`, snapshot ID, or stable Patwari URI.
+- Is not a runtime dependency of Patwari.
 
 ## Domain model
 
@@ -205,7 +205,7 @@ not be used as artifact identity.
 
 ### Archival receipt
 
-The completion response is evidence that Khata received and verified the declared snapshot.
+The completion response is evidence that Patwari received and verified the declared snapshot.
 
 ```text
 snapshot_id
@@ -216,7 +216,7 @@ completed_at
 server_version
 ```
 
-This receipt confirms Khata integrity only. Filesystem replication and backup remain external
+This receipt confirms Patwari integrity only. Filesystem replication and backup remain external
 operational responsibilities.
 
 ## Manifest v1
@@ -259,12 +259,12 @@ operational responsibilities.
 }
 ```
 
-The manifest describes individually downloadable files. Khata treats their contents as opaque even
+The manifest describes individually downloadable files. Patwari treats their contents as opaque even
 though they are server-readable.
 
 ## API v1
 
-The OpenAPI document will be the cross-repository contract. Khata must not expose database models
+The OpenAPI document will be the cross-repository contract. Patwari must not expose database models
 as its public protocol.
 
 ```text
@@ -303,14 +303,14 @@ disabled by default until retention semantics and CLI confirmation are implement
 ### Resumable uploads
 
 1. Munshi submits the complete manifest.
-2. Khata returns the snapshot, artifact IDs, chunk size, and existing chunk bitmap.
+2. Patwari returns the snapshot, artifact IDs, chunk size, and existing chunk bitmap.
 3. Munshi uploads missing fixed-size chunks.
 4. Each chunk request includes its byte length and checksum.
-5. Khata writes chunks into snapshot-scoped temporary storage.
+5. Patwari writes chunks into snapshot-scoped temporary storage.
 6. Munshi requests snapshot completion.
-7. Khata assembles and verifies every artifact against the manifest.
+7. Patwari assembles and verifies every artifact against the manifest.
 8. Verified content is atomically moved into the blob store.
-9. Khata commits the snapshot as `complete` and returns the archival receipt.
+9. Patwari commits the snapshot as `complete` and returns the archival receipt.
 
 Incomplete uploads are never listed as archived snapshots. A garbage-collection job removes
 abandoned temporary uploads after a configurable period.
@@ -319,7 +319,7 @@ abandoned temporary uploads after a configurable period.
 
 ```text
 /data/
-├── khata.db
+├── patwari.db
 ├── blobs/
 │   └── sha256/
 │       └── ab/
@@ -335,16 +335,16 @@ abandoned temporary uploads after a configurable period.
 - Temporary uploads and completed blobs are on the same filesystem so promotion can use atomic
   rename.
 - Database and blob paths live on one dedicated persistent volume.
-- Backup tooling must capture SQLite and blobs consistently. Khata will provide a maintenance
+- Backup tooling must capture SQLite and blobs consistently. Patwari will provide a maintenance
   command that creates a SQLite online backup and a blob inventory for filesystem-level backup.
-- Khata must not reuse a disposable application cache volume.
+- Patwari must not reuse a disposable application cache volume.
 
 Reference counts are transactional metadata. Blob garbage collection deletes only content with no
 snapshot references and only after a grace period.
 
 ## Network and trust model
 
-Khata v1 has no application authentication. Therefore:
+Patwari v1 has no application authentication. Therefore:
 
 - it must not be exposed directly to the public internet;
 - its listener is configurable and defaults to loopback;
@@ -368,11 +368,11 @@ Programmatic consumers can:
 
 Content search and learning extraction belong in separate tools. A future tool can download or
 stream archived transcripts, derive learnings, and write curated results to Notesmith without
-coupling that workflow to Khata.
+coupling that workflow to Patwari.
 
 ## Local cleanup safety
 
-Khata does not delete source files. Munshi may later provide:
+Patwari does not delete source files. Munshi may later provide:
 
 ```text
 munshi archive <session-id>
@@ -384,13 +384,13 @@ munshi prune --archived --older-than <duration>
 The non-dry-run prune command must require:
 
 - a locally stored archival receipt;
-- a matching complete snapshot fetched from Khata;
+- a matching complete snapshot fetched from Patwari;
 - matching manifest and artifact checksums;
 - an explicit confirmation showing files and bytes to be removed;
 - a configurable minimum age;
 - no active or resumable local session state.
 
-Automatic cleanup is out of scope for v1. Khata cannot verify that its filesystem has been backed
+Automatic cleanup is out of scope for v1. Patwari cannot verify that its filesystem has been backed
 up elsewhere, so the operator remains responsible for that durability decision.
 
 ## Implementation stack
@@ -465,11 +465,11 @@ Exit criteria:
 
 ### Phase 4: Munshi integration
 
-- Generate or implement the Khata API client from OpenAPI.
+- Generate or implement the Patwari API client from OpenAPI.
 - Add archive, retry, status, and download commands.
 - Persist upload progress and archival receipts locally.
 - Add manual prune dry-run and guarded deletion.
-- Add the Khata reference fields used by Notesmith summaries.
+- Add the Patwari reference fields used by Notesmith summaries.
 
 Exit criteria:
 
@@ -487,7 +487,7 @@ Exit criteria:
 
 Exit criteria:
 
-- a clean host can restore Khata from the external filesystem backup;
+- a clean host can restore Patwari from the external filesystem backup;
 - restored metadata and blobs pass a complete integrity scan;
 - upgrades preserve existing archives through tested migrations.
 
@@ -497,11 +497,11 @@ Exit criteria:
 - Provide efficient manifest and artifact streaming for batch consumers.
 - Build analysis as a separate client that writes curated findings to Notesmith.
 
-This phase does not add model execution or derived knowledge to Khata itself.
+This phase does not add model execution or derived knowledge to Patwari itself.
 
 ## v1 completion definition
 
-Khata v1 is complete when Munshi can archive a real Copilot CLI session to quadhost, resume an
+Patwari v1 is complete when Munshi can archive a real Copilot CLI session to quadhost, resume an
 interrupted upload, receive a verified immutable receipt, list and download the snapshot, reproduce
 all compressed files byte-for-byte, and safely preview manual removal of the original local files.
 
@@ -510,6 +510,6 @@ all compressed files byte-for-byte, and safely preview manual removal of the ori
 - Exact Copilot CLI artifact set and consistency strategy, pending the Phase 0 spike.
 - Chunk size and maximum artifact/snapshot limits, informed by real session measurements.
 - Retention and explicit remote deletion policy.
-- Authentication if Khata crosses the trusted network boundary.
+- Authentication if Patwari crosses the trusted network boundary.
 - Restore compatibility contracts for each coding agent.
 - PostgreSQL or object-storage backends if single-node operation becomes insufficient.

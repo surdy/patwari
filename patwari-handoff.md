@@ -1,23 +1,23 @@
-# Khata planning handoff
+# Patwari planning handoff
 
-Use this document to start a separate planning session for **Khata**, the remote history and backup
+Use this document to start a separate planning session for **Patwari**, the remote history and backup
 server paired with [Munshi](../README.md).
 
 ## Product relationship
 
 - **Munshi** is the local client and session archivist.
-- **Khata** is the central server that preserves session history.
+- **Patwari** is the central server that preserves session history.
 - Munshi captures local coding-agent sessions, generates summaries, packages backup artifacts, and
-  communicates with Khata.
-- Khata accepts, indexes, stores, retrieves, and eventually helps restore those records.
+  communicates with Patwari.
+- Patwari accepts, indexes, stores, retrieves, and eventually helps restore those records.
 - The two projects must remain independently deployable and versioned.
 
 The name follows the same administrative/bookkeeping theme:
 
 - *Munshi*: scribe, secretary, or record keeper.
-- *Khata*: account, ledger, or account book.
+- *Patwari*: account, ledger, or account book.
 
-A useful product phrase is: **Munshi writes the record; Khata keeps the ledger.**
+A useful product phrase is: **Munshi writes the record; Patwari keeps the ledger.**
 
 ## Current Munshi direction
 
@@ -40,9 +40,9 @@ The full Munshi plan is in [`README.md`](../README.md). Important decisions alre
 Munshi is intentionally local-first. A remote failure must never prevent local Markdown creation or
 advance a backup cursor incorrectly.
 
-## Khata's likely role
+## Patwari's likely role
 
-Khata should become the authoritative remote ledger for coding-agent session history. The initial
+Patwari should become the authoritative remote ledger for coding-agent session history. The initial
 planning session should decide whether that includes both summaries and full backups from the
 beginning or whether these are staged separately.
 
@@ -59,7 +59,7 @@ Potential responsibilities:
 - Enforce authentication, authorization, quotas, and retention policies.
 - Expose machine-oriented APIs first; a web UI can come later.
 
-Khata should not understand how to run Copilot CLI or generate summaries. That remains a Munshi
+Patwari should not understand how to run Copilot CLI or generate summaries. That remains a Munshi
 responsibility.
 
 ## Scope candidates
@@ -68,7 +68,7 @@ The planning session should evaluate these three possible first releases.
 
 ### Option A: Summary ledger
 
-Khata initially stores only the rendered Markdown report and normalized metadata.
+Patwari initially stores only the rendered Markdown report and normalized metadata.
 
 Advantages:
 
@@ -85,12 +85,12 @@ Disadvantages:
 
 ### Option B: Artifact backup only
 
-Khata stores manifests and opaque compressed files while Notesmith continues to receive summaries.
+Patwari stores manifests and opaque compressed files while Notesmith continues to receive summaries.
 
 Advantages:
 
-- Clear separation: Notesmith is for knowledge, Khata is for backup.
-- Khata does not need to interpret Markdown or summary structure.
+- Clear separation: Notesmith is for knowledge, Patwari is for backup.
+- Patwari does not need to interpret Markdown or summary structure.
 - Focuses immediately on the unique requirement.
 
 Disadvantages:
@@ -101,7 +101,7 @@ Disadvantages:
 
 ### Option C: Unified session ledger
 
-Khata stores normalized session metadata, Markdown summary revisions, and optional opaque backup
+Patwari stores normalized session metadata, Markdown summary revisions, and optional opaque backup
 artifacts under one logical session record.
 
 Advantages:
@@ -122,7 +122,7 @@ model without building every feature.
 
 ## Core domain model
 
-Khata should distinguish a logical session from its evolving summary and immutable backup
+Patwari should distinguish a logical session from its evolving summary and immutable backup
 snapshots.
 
 ```text
@@ -189,7 +189,7 @@ content_hash
 created_at
 ```
 
-Summary revisions should be append-only on Khata even if Munshi and Notesmith present only the
+Summary revisions should be append-only on Patwari even if Munshi and Notesmith present only the
 latest revision. This preserves history and simplifies conflict investigation.
 
 ### Backup snapshot
@@ -307,10 +307,10 @@ GET    /api/v1/snapshots/{snapshot_id}/artifacts/{artifact_id}
 
 The planning session should compare:
 
-- Direct streaming upload through Khata.
+- Direct streaming upload through Patwari.
 - Pre-signed object-store uploads.
 - TUS or another resumable-upload protocol.
-- Multipart upload managed by Khata.
+- Multipart upload managed by Patwari.
 
 For a personal self-hosted deployment, direct streaming may be the simplest first implementation.
 The storage abstraction should not prevent an S3-compatible backend later.
@@ -382,7 +382,7 @@ The planning session must choose and document the trust model:
 
 ### Server-readable storage
 
-Khata terminates TLS and stores plaintext artifacts, potentially encrypted at rest by the host or
+Patwari terminates TLS and stores plaintext artifacts, potentially encrypted at rest by the host or
 storage backend.
 
 Benefits:
@@ -392,12 +392,12 @@ Benefits:
 
 Costs:
 
-- Khata and its operators can read all history.
+- Patwari and its operators can read all history.
 - A server compromise exposes content.
 
 ### Client-side encrypted artifacts
 
-Munshi compresses and encrypts artifacts before upload. Khata stores ciphertext and metadata.
+Munshi compresses and encrypts artifacts before upload. Patwari stores ciphertext and metadata.
 
 Benefits:
 
@@ -448,7 +448,7 @@ semantics.
 
 ## Retention and garbage collection
 
-Khata should define:
+Patwari should define:
 
 - Whether all summary revisions are retained forever.
 - Whether duplicate artifacts are deduplicated.
@@ -463,7 +463,7 @@ Destructive operations should require explicit authorization and produce audit r
 
 ## Restore flow
 
-Khata serves records and artifacts; Munshi performs the agent-specific restore.
+Patwari serves records and artifacts; Munshi performs the agent-specific restore.
 
 Proposed flow:
 
@@ -478,30 +478,30 @@ Proposed flow:
 9. Munshi restores atomically where possible.
 10. Munshi verifies that the source harness can discover or resume the session.
 
-Khata should never claim a snapshot is restorable merely because upload completed. Restorability
+Patwari should never claim a snapshot is restorable merely because upload completed. Restorability
 depends on a matching Munshi adapter and harness version.
 
 ## Relationship with Notesmith
 
-Notesmith and Khata serve different primary purposes:
+Notesmith and Patwari serve different primary purposes:
 
 - **Notesmith** stores curated knowledge in human-owned Markdown vaults.
-- **Khata** stores versioned coding-session records and backup artifacts.
+- **Patwari** stores versioned coding-session records and backup artifacts.
 
 Possible integration:
 
 - Munshi sends the latest readable summary to Notesmith.
-- Munshi sends every summary revision and backup snapshot to Khata.
-- A Notesmith note may contain the Khata session ID or URL.
-- Khata may expose the latest Markdown summary, but it should not adopt Notesmith's vault,
+- Munshi sends every summary revision and backup snapshot to Patwari.
+- A Notesmith note may contain the Patwari session ID or URL.
+- Patwari may expose the latest Markdown summary, but it should not adopt Notesmith's vault,
   routing, or note-editing semantics.
 
-The planning session should decide whether Khata stores Markdown summaries in Phase 1 or begins with
+The planning session should decide whether Patwari stores Markdown summaries in Phase 1 or begins with
 artifact backup only. It should not make Notesmith a runtime dependency.
 
 ## Relationship with Madari
 
-Madari may eventually browse Khata history through Munshi or directly through a read-only Khata
+Madari may eventually browse Patwari history through Munshi or directly through a read-only Patwari
 client.
 
 Potential features:
@@ -519,7 +519,7 @@ GUI.
 
 ## Technology choice
 
-The Khata planning session should evaluate the server stack rather than inherit Rust automatically.
+The Patwari planning session should evaluate the server stack rather than inherit Rust automatically.
 
 Rust is a strong candidate because:
 
@@ -553,7 +553,7 @@ Known preferences:
 
 Questions for the planning session:
 
-- Is the first Khata deployment single-user only?
+- Is the first Patwari deployment single-user only?
 - Should it run beside Notesmith on quadhost?
 - Is local filesystem storage sufficient initially?
 - Should artifact blobs live on local disk or NFS?
@@ -564,14 +564,14 @@ Questions for the planning session:
 - Must remote browsing work before restore is implemented?
 - Are raw artifacts client-side encrypted from the first release?
 
-Do not assume Notesmith's current deployment volume choices are appropriate for Khata. Backup data
+Do not assume Notesmith's current deployment volume choices are appropriate for Patwari. Backup data
 has different durability requirements from disposable caches.
 
 ## Planning deliverables
 
 The next session should produce:
 
-1. A concise product scope and non-goals for Khata v1.
+1. A concise product scope and non-goals for Patwari v1.
 2. A decision between summary ledger, artifact backup, or unified session ledger.
 3. A threat model and encryption decision.
 4. An initial domain schema.
@@ -580,7 +580,7 @@ The next session should produce:
 7. A storage-backend decision for the first deployment.
 8. Authentication and device-token design.
 9. Retention and deletion semantics.
-10. A restore responsibility boundary between Khata and Munshi.
+10. A restore responsibility boundary between Patwari and Munshi.
 11. A phased implementation roadmap.
 12. Testing, migration, backup, and disaster-recovery plans.
 13. A recommendation for implementation language and framework.
@@ -596,7 +596,7 @@ https://github.com/surdy/munshi
 The expected eventual repository is:
 
 ```text
-surdy/khata
+surdy/patwari
 ```
 
 It should be private initially.
@@ -604,13 +604,13 @@ It should be private initially.
 ## Suggested prompt for the next session
 
 ```text
-Plan Khata, the central session-history and backup server paired with Munshi.
+Plan Patwari, the central session-history and backup server paired with Munshi.
 
 Start by reading:
 - /Users/surdy/repos/munshi/README.md
-- /Users/surdy/repos/munshi/docs/khata-handoff.md
+- /Users/surdy/repos/munshi/docs/patwari-handoff.md
 
-Khata should receive versioned coding-agent session metadata, Markdown summary revisions, and
+Patwari should receive versioned coding-agent session metadata, Markdown summary revisions, and
 eventually compressed full-session artifacts from Munshi. It must support idempotent and resumable
 uploads, retrieval, and a safe future restore flow. It is a separate repository and must not depend
 on Notesmith or Madari, though both may integrate with it.
