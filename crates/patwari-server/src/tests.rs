@@ -14,9 +14,10 @@ use crate::{
     ReconciliationError, Service,
     config::Config,
     contract::{
-        Artifact, CaptureProvenance, CompletionResponse, Compression, Manifest, ManifestInput,
-        Receipt, SessionInput, SnapshotCapturesResponse, SnapshotResponse, UploadResponse,
-        UploadStatus, UploadStatusResponse,
+        Artifact, ArtifactMetadataResponse, CanonicalManifestResponse, CanonicalManifestSummary,
+        CaptureProvenance, CompletionResponse, Compression, Manifest, ManifestInput,
+        PaginatedResponse, Receipt, SessionInput, SessionResponse, SnapshotCapturesResponse,
+        SnapshotResponse, SnapshotSummary, UploadResponse, UploadStatus, UploadStatusResponse,
     },
 };
 
@@ -81,6 +82,23 @@ async fn call(app: Router, request: Request<Body>) -> (StatusCode, HeaderMap, Ve
     (status, headers, bytes)
 }
 
+async fn get_json<T: serde::de::DeserializeOwned>(
+    service: &Service,
+    config: &Config,
+    uri: impl AsRef<str>,
+) -> T {
+    let (status, _, body) = call(
+        service.router(config),
+        Request::builder()
+            .uri(uri.as_ref())
+            .body(Body::empty())
+            .expect("GET request is valid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    serde_json::from_slice(&body).expect("GET response parses")
+}
+
 fn json_request<T: serde::Serialize + ?Sized>(method: &str, uri: &str, body: &T) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -138,6 +156,27 @@ fn manifest_with_session(
             "compression": compression
         }
     })
+}
+
+fn manifest_with_context(
+    original: &[u8],
+    stored: &[u8],
+    source_session_id: &str,
+    project: &str,
+    repository: &str,
+    branch: &str,
+    source_metadata: serde_json::Value,
+) -> serde_json::Value {
+    let mut document =
+        manifest_with_session(original, stored, Compression::Identity, source_session_id);
+    let capture = document["capture"]
+        .as_object_mut()
+        .expect("manifest capture is an object");
+    capture.insert("project".into(), serde_json::json!(project));
+    capture.insert("repository".into(), serde_json::json!(repository));
+    capture.insert("branch".into(), serde_json::json!(branch));
+    capture.insert("source_metadata".into(), source_metadata);
+    document
 }
 
 fn multi_manifest(
@@ -2985,4 +3024,814 @@ async fn restart_backfills_completed_capture_provenance_and_reissues_receipt() {
         complete_upload_for_completion(&restarted, &config, &upload.completion_url).await;
     assert_eq!(reissued.receipt.snapshot_id, original.receipt.snapshot_id);
     assert_eq!(reissued.receipt.manifest_sha256, capture.manifest_sha256);
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn archive_browsing_projects_latest_context_without_rewriting_history() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let first_client = Uuid::new_v4();
+    let second_client = Uuid::new_v4();
+    register(service.router(&config), first_client).await;
+    register(service.router(&config), second_client).await;
+
+    let old_bytes = b"old branch capture";
+    let old_upload = upload_full(
+        &service,
+        &config,
+        first_client,
+        "moved-branch-old",
+        manifest_with_context(
+            old_bytes,
+            old_bytes,
+            "moved-branch-session",
+            "archive-project",
+            "example/archive",
+            "main",
+            serde_json::json!({"opaque": "old-source-value"}),
+        ),
+        old_bytes,
+    )
+    .await;
+    let old_completion =
+        complete_upload_for_completion(&service, &config, &old_upload.completion_url).await;
+
+    let new_bytes = b"release branch capture";
+    let latest_upload = upload_full(
+        &service,
+        &config,
+        first_client,
+        "moved-branch-latest",
+        manifest_with_context(
+            new_bytes,
+            new_bytes,
+            "moved-branch-session",
+            "archive-project",
+            "example/archive",
+            "release",
+            serde_json::json!({"opaque": "first-release-observation"}),
+        ),
+        new_bytes,
+    )
+    .await;
+    let latest_completion =
+        complete_upload_for_completion(&service, &config, &latest_upload.completion_url).await;
+
+    let coalesced_upload = upload_full(
+        &service,
+        &config,
+        second_client,
+        "moved-branch-coalesced",
+        manifest_with_context(
+            new_bytes,
+            new_bytes,
+            "moved-branch-session",
+            "archive-project",
+            "example/archive",
+            "release",
+            serde_json::json!({"opaque": "second-client-private-context"}),
+        ),
+        new_bytes,
+    )
+    .await;
+    let coalesced_completion =
+        complete_upload_for_completion(&service, &config, &coalesced_upload.completion_url).await;
+    assert_eq!(
+        coalesced_completion.receipt.snapshot_id, latest_completion.receipt.snapshot_id,
+        "distinct capture provenance can coalesce to one immutable snapshot"
+    );
+    assert_ne!(
+        old_completion.receipt.snapshot_id,
+        latest_completion.receipt.snapshot_id
+    );
+
+    let release_sessions: PaginatedResponse<SessionResponse> = get_json(
+        &service,
+        &config,
+        "/api/v1/sessions?branch=release&project=archive-project&repository=example/archive",
+    )
+    .await;
+    assert_eq!(release_sessions.items.len(), 1);
+    let session = &release_sessions.items[0];
+    assert_eq!(session.session_id, latest_completion.receipt.session_id);
+    assert_eq!(session.latest_snapshot.branch.as_deref(), Some("release"));
+    assert_eq!(
+        session.latest_snapshot.snapshot_id,
+        latest_completion.receipt.snapshot_id
+    );
+
+    let stale_branch: PaginatedResponse<SessionResponse> =
+        get_json(&service, &config, "/api/v1/sessions?branch=main").await;
+    assert!(stale_branch.items.is_empty());
+    let second_client_sessions: PaginatedResponse<SessionResponse> = get_json(
+        &service,
+        &config,
+        format!("/api/v1/sessions?client_id={second_client}"),
+    )
+    .await;
+    assert_eq!(
+        second_client_sessions.items.len(),
+        1,
+        "a client matches when it contributed any capture to the projected latest snapshot"
+    );
+    let activity_from: PaginatedResponse<SessionResponse> = get_json(
+        &service,
+        &config,
+        "/api/v1/sessions?activity_from=2000-01-01T00:00:00Z",
+    )
+    .await;
+    assert_eq!(activity_from.items.len(), 1);
+    let activity_to: PaginatedResponse<SessionResponse> = get_json(
+        &service,
+        &config,
+        "/api/v1/sessions?activity_to=9999-12-31T23:59:59Z",
+    )
+    .await;
+    assert_eq!(activity_to.items.len(), 1);
+    let (invalid_activity_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .uri(
+                "/api/v1/sessions?activity_from=2027-01-01T00:00:00Z&activity_to=2026-01-01T00:00:00Z",
+            )
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(invalid_activity_status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let inspected_session: SessionResponse = get_json(
+        &service,
+        &config,
+        format!("/api/v1/sessions/{}", session.session_id),
+    )
+    .await;
+    assert_eq!(inspected_session, *session);
+    let session_snapshots: PaginatedResponse<SnapshotSummary> = get_json(
+        &service,
+        &config,
+        format!(
+            "/api/v1/sessions/{}/snapshots?limit=100",
+            session.session_id
+        ),
+    )
+    .await;
+    assert_eq!(session_snapshots.items.len(), 2);
+    assert_eq!(
+        session_snapshots.items[0].snapshot_id,
+        latest_completion.receipt.snapshot_id
+    );
+    let historical: SnapshotResponse = get_json(
+        &service,
+        &config,
+        format!("/api/v1/snapshots/{}", old_completion.receipt.snapshot_id),
+    )
+    .await;
+    assert_eq!(historical.manifest.capture.branch.as_deref(), Some("main"));
+    assert_eq!(
+        historical.manifest.capture.source_metadata.get("opaque"),
+        Some(&"old-source-value".to_owned())
+    );
+
+    let release_snapshots: PaginatedResponse<SnapshotSummary> = get_json(
+        &service,
+        &config,
+        "/api/v1/snapshots?branch=release&artifact_set_version=1",
+    )
+    .await;
+    assert_eq!(release_snapshots.items.len(), 1);
+    assert_eq!(
+        release_snapshots.items[0].snapshot_id,
+        latest_completion.receipt.snapshot_id
+    );
+    let main_snapshots: PaginatedResponse<SnapshotSummary> =
+        get_json(&service, &config, "/api/v1/snapshots?branch=main").await;
+    assert_eq!(
+        main_snapshots.items[0].snapshot_id,
+        old_completion.receipt.snapshot_id
+    );
+
+    let session_captures: PaginatedResponse<CaptureProvenance> = get_json(
+        &service,
+        &config,
+        format!("/api/v1/sessions/{}/captures?limit=100", session.session_id),
+    )
+    .await;
+    assert_eq!(session_captures.items.len(), 3);
+    let archive_captures: PaginatedResponse<CaptureProvenance> =
+        get_json(&service, &config, "/api/v1/captures?limit=100").await;
+    assert_eq!(archive_captures.items.len(), 3);
+    let snapshot_capture_page: SnapshotCapturesResponse = get_json(
+        &service,
+        &config,
+        format!(
+            "/api/v1/snapshots/{}/captures?limit=1",
+            latest_completion.receipt.snapshot_id
+        ),
+    )
+    .await;
+    assert_eq!(snapshot_capture_page.captures.len(), 1);
+    assert!(snapshot_capture_page.high_watermark.is_some());
+    let snapshot_capture_next: SnapshotCapturesResponse = get_json(
+        &service,
+        &config,
+        format!(
+            "/api/v1/snapshots/{}/captures?limit=1&cursor={}",
+            latest_completion.receipt.snapshot_id,
+            snapshot_capture_page
+                .next_cursor
+                .as_deref()
+                .expect("coalesced snapshot has a second capture")
+        ),
+    )
+    .await;
+    assert_eq!(snapshot_capture_next.captures.len(), 1);
+    let coalesced_capture: CaptureProvenance =
+        get_json(&service, &config, &coalesced_completion.capture.capture_url).await;
+    assert_eq!(
+        coalesced_capture.source_metadata.get("opaque"),
+        Some(&"second-client-private-context".to_owned())
+    );
+    assert_eq!(coalesced_capture.artifact_set_version, 1);
+    let exact_lookup: CaptureProvenance = get_json(
+        &service,
+        &config,
+        format!("/api/v1/captures?client_id={second_client}&capture_id=moved-branch-coalesced"),
+    )
+    .await;
+    assert_eq!(exact_lookup, coalesced_capture);
+
+    let manifests: PaginatedResponse<CanonicalManifestSummary> = get_json(
+        &service,
+        &config,
+        format!("/api/v1/manifests?session_id={}", session.session_id),
+    )
+    .await;
+    assert_eq!(manifests.items.len(), 3);
+    let selected_manifest = manifests
+        .items
+        .iter()
+        .find(|item| item.manifest_id == release_snapshots.items[0].manifest_id)
+        .expect("the selected snapshot manifest is listed");
+    let canonical_manifest: CanonicalManifestResponse =
+        get_json(&service, &config, &selected_manifest.manifest_url).await;
+    assert_eq!(
+        canonical_manifest.snapshot_id,
+        latest_completion.receipt.snapshot_id
+    );
+    let snapshot_manifest: CanonicalManifestResponse = get_json(
+        &service,
+        &config,
+        format!(
+            "/api/v1/snapshots/{}/manifest",
+            latest_completion.receipt.snapshot_id
+        ),
+    )
+    .await;
+    assert_eq!(
+        snapshot_manifest.manifest_id,
+        canonical_manifest.manifest_id
+    );
+    let coalesced_manifest: CanonicalManifestResponse =
+        get_json(&service, &config, &coalesced_capture.manifest_url).await;
+    assert_eq!(
+        coalesced_manifest.capture_record_id,
+        coalesced_capture.capture_record_id
+    );
+    assert_eq!(
+        coalesced_manifest
+            .manifest
+            .capture
+            .source_metadata
+            .get("opaque"),
+        Some(&"second-client-private-context".to_owned())
+    );
+
+    let artifacts: PaginatedResponse<ArtifactMetadataResponse> = get_json(
+        &service,
+        &config,
+        format!(
+            "/api/v1/artifacts?snapshot_id={}",
+            latest_completion.receipt.snapshot_id
+        ),
+    )
+    .await;
+    assert_eq!(artifacts.items.len(), 1);
+    let artifact: ArtifactMetadataResponse =
+        get_json(&service, &config, &artifacts.items[0].metadata_url).await;
+    assert_eq!(artifact, artifacts.items[0]);
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn archive_browsing_keyset_pages_are_stable_across_newer_records_and_ties() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let mut snapshot_ids = Vec::new();
+    for name in ["tie-one", "tie-two", "tie-three"] {
+        let bytes = format!("pagination {name}").into_bytes();
+        let upload = upload_full(
+            &service,
+            &config,
+            client_id,
+            name,
+            manifest_with_context(
+                &bytes,
+                &bytes,
+                name,
+                "pagination-project",
+                "example/pagination",
+                "main",
+                serde_json::json!({}),
+            ),
+            &bytes,
+        )
+        .await;
+        let completion =
+            complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+        snapshot_ids.push(completion.receipt.snapshot_id);
+    }
+    let tied_time = "2000-01-01T00:00:00Z";
+    let tied_sort_key =
+        crate::database::sort_key_from_rfc3339(tied_time).expect("tied_time parses");
+    for snapshot_id in &snapshot_ids {
+        sqlx::query("UPDATE snapshots SET completed_at = ?1, completed_at_seq = ?2 WHERE id = ?3")
+            .bind(tied_time)
+            .bind(tied_sort_key)
+            .bind(snapshot_id)
+            .execute(&service.state.database)
+            .await
+            .expect("test can establish a deterministic timestamp tie");
+        sqlx::query(
+            "UPDATE session_latest_context
+             SET completed_at = ?1, completed_at_seq = ?2 WHERE snapshot_id = ?3",
+        )
+        .bind(tied_time)
+        .bind(tied_sort_key)
+        .bind(snapshot_id)
+        .execute(&service.state.database)
+        .await
+        .expect("projection timestamp tie updates");
+    }
+    let mut expected = snapshot_ids.clone();
+    expected.sort_unstable_by(|left, right| right.cmp(left));
+
+    let first_page: PaginatedResponse<SnapshotSummary> =
+        get_json(&service, &config, "/api/v1/snapshots?limit=1").await;
+    assert_eq!(first_page.items.len(), 1);
+    assert_eq!(first_page.items[0].snapshot_id, expected[0]);
+    assert!(first_page.high_watermark.is_some());
+    let first_cursor = first_page
+        .next_cursor
+        .clone()
+        .expect("more tied snapshots require a cursor");
+    assert!(
+        !first_cursor.contains(&expected[0]),
+        "the cursor is opaque rather than a raw resource identifier"
+    );
+
+    let newer_bytes = b"newer pagination record";
+    let newer_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "pagination-newer",
+        manifest_with_context(
+            newer_bytes,
+            newer_bytes,
+            "pagination-newer",
+            "pagination-project",
+            "example/pagination",
+            "main",
+            serde_json::json!({}),
+        ),
+        newer_bytes,
+    )
+    .await;
+    let newer =
+        complete_upload_for_completion(&service, &config, &newer_upload.completion_url).await;
+
+    let mut seen = vec![first_page.items[0].snapshot_id.clone()];
+    let mut cursor = Some(first_cursor);
+    while let Some(next_cursor) = cursor {
+        let page: PaginatedResponse<SnapshotSummary> = get_json(
+            &service,
+            &config,
+            format!("/api/v1/snapshots?limit=1&cursor={next_cursor}"),
+        )
+        .await;
+        seen.extend(page.items.iter().map(|item| item.snapshot_id.clone()));
+        cursor = page.next_cursor;
+    }
+    assert_eq!(seen, expected);
+    assert!(!seen.contains(&newer.receipt.snapshot_id));
+    assert_eq!(
+        seen.iter().collect::<std::collections::HashSet<_>>().len(),
+        seen.len(),
+        "keyset traversal neither duplicates nor skips tied records"
+    );
+
+    let (invalid_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .uri("/api/v1/snapshots?cursor=not-a-cursor")
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(invalid_status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (mismatched_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .uri(format!(
+                "/api/v1/snapshots?branch=main&cursor={}",
+                first_page
+                    .next_cursor
+                    .as_deref()
+                    .expect("first cursor remains available")
+            ))
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(mismatched_status, StatusCode::UNPROCESSABLE_ENTITY);
+    for limit in [0, 101] {
+        let (status, _, _) = call(
+            service.router(&config),
+            Request::builder()
+                .uri(format!("/api/v1/snapshots?limit={limit}"))
+                .body(Body::empty())
+                .expect("request is valid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+/// RFC 3339's fractional-second component has variable width, so `.12Z`
+/// (120 milliseconds) is TEXT-greater than `.123Z` (123 milliseconds) even
+/// though it is chronologically earlier. Every keyset-ordered resource must
+/// sort by the numeric microsecond key instead of the RFC 3339 column, or
+/// this exact pair sorts backwards.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn numeric_sort_key_orders_variable_precision_fractional_seconds_correctly() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let earlier_bytes = b"variable precision earlier";
+    let earlier_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "precision-earlier",
+        manifest_with_context(
+            earlier_bytes,
+            earlier_bytes,
+            "precision-session",
+            "precision-project",
+            "example/precision",
+            "main",
+            serde_json::json!({}),
+        ),
+        earlier_bytes,
+    )
+    .await;
+    let earlier =
+        complete_upload_for_completion(&service, &config, &earlier_upload.completion_url).await;
+
+    let later_bytes = b"variable precision later";
+    let later_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "precision-later",
+        manifest_with_context(
+            later_bytes,
+            later_bytes,
+            "precision-session",
+            "precision-project",
+            "example/precision",
+            "main",
+            serde_json::json!({}),
+        ),
+        later_bytes,
+    )
+    .await;
+    let later =
+        complete_upload_for_completion(&service, &config, &later_upload.completion_url).await;
+
+    let earlier_text = "2024-06-01T00:00:00.12Z";
+    let later_text = "2024-06-01T00:00:00.123Z";
+    assert!(
+        later_text < earlier_text,
+        "the fixture must reproduce the RFC 3339 TEXT-ordering inversion this test guards against"
+    );
+    let earlier_key = crate::database::sort_key_from_rfc3339(earlier_text).expect("parses");
+    let later_key = crate::database::sort_key_from_rfc3339(later_text).expect("parses");
+    assert!(
+        later_key > earlier_key,
+        "the numeric sort key must still treat .123Z as chronologically later"
+    );
+
+    for (snapshot_id, text, key) in [
+        (&earlier.receipt.snapshot_id, earlier_text, earlier_key),
+        (&later.receipt.snapshot_id, later_text, later_key),
+    ] {
+        sqlx::query("UPDATE snapshots SET completed_at = ?1, completed_at_seq = ?2 WHERE id = ?3")
+            .bind(text)
+            .bind(key)
+            .bind(snapshot_id)
+            .execute(&service.state.database)
+            .await
+            .expect("test can set a variable-precision fractional-second timestamp");
+        sqlx::query(
+            "UPDATE captures SET server_completed_at = ?1, server_completed_at_seq = ?2
+             WHERE snapshot_id = ?3",
+        )
+        .bind(text)
+        .bind(key)
+        .bind(snapshot_id)
+        .execute(&service.state.database)
+        .await
+        .expect("capture provenance timestamp updates");
+        sqlx::query(
+            "UPDATE session_latest_context SET completed_at = ?1, completed_at_seq = ?2
+             WHERE snapshot_id = ?3",
+        )
+        .bind(text)
+        .bind(key)
+        .bind(snapshot_id)
+        .execute(&service.state.database)
+        .await
+        .expect("projection timestamp updates");
+    }
+
+    let snapshots: PaginatedResponse<SnapshotSummary> =
+        get_json(&service, &config, "/api/v1/snapshots?limit=100").await;
+    assert_eq!(
+        snapshots.items[0].snapshot_id, later.receipt.snapshot_id,
+        "the chronologically later .123Z snapshot must sort first even though it is TEXT-smaller"
+    );
+    assert_eq!(snapshots.items[1].snapshot_id, earlier.receipt.snapshot_id);
+    assert_eq!(snapshots.items[0].completed_at, later_text);
+    assert_eq!(snapshots.items[1].completed_at, earlier_text);
+
+    let captures: PaginatedResponse<CaptureProvenance> =
+        get_json(&service, &config, "/api/v1/captures?limit=100").await;
+    assert_eq!(
+        captures.items[0].snapshot_id, later.receipt.snapshot_id,
+        "captures must also sort by the numeric server-completion key, not RFC 3339 text"
+    );
+    assert_eq!(captures.items[1].snapshot_id, earlier.receipt.snapshot_id);
+
+    let sessions: PaginatedResponse<SessionResponse> = get_json(
+        &service,
+        &config,
+        "/api/v1/sessions?project=precision-project",
+    )
+    .await;
+    assert_eq!(sessions.items.len(), 1);
+    assert_eq!(
+        sessions.items[0].latest_snapshot.snapshot_id, later.receipt.snapshot_id,
+        "the session's projected latest snapshot must be the chronologically later one"
+    );
+}
+
+/// The numeric ordering key is backfilled once for rows written before it
+/// existed (see `ingestion::backfill_sort_keys`); this never touches the
+/// RFC 3339 receipt/API text those rows already carry.
+#[tokio::test]
+async fn restart_backfills_numeric_sort_keys_without_mutating_receipt_text() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"pre-migration sort key";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "pre-migration-sort-key",
+        manifest(bytes, bytes, Compression::Identity),
+        bytes,
+    )
+    .await;
+    let original = complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+
+    for statement in [
+        "UPDATE snapshots SET completed_at_seq = 0 WHERE id = ?1",
+        "UPDATE captures SET server_completed_at_seq = 0 WHERE snapshot_id = ?1",
+        "UPDATE artifacts SET created_at_seq = 0 WHERE snapshot_id = ?1",
+    ] {
+        sqlx::query(statement)
+            .bind(&original.receipt.snapshot_id)
+            .execute(&service.state.database)
+            .await
+            .expect("simulate a pre-migration row with an unbackfilled sort key");
+    }
+    let before: (String, i64) =
+        sqlx::query_as("SELECT completed_at, completed_at_seq FROM snapshots WHERE id = ?1")
+            .bind(&original.receipt.snapshot_id)
+            .fetch_one(&service.state.database)
+            .await
+            .expect("snapshot row is readable before restart");
+    assert_eq!(before.1, 0);
+    drop(service);
+
+    let (restarted, _) = Service::bootstrap(&config)
+        .await
+        .expect("backfills the numeric sort key on restart");
+
+    let snapshot_after: (String, i64) =
+        sqlx::query_as("SELECT completed_at, completed_at_seq FROM snapshots WHERE id = ?1")
+            .bind(&original.receipt.snapshot_id)
+            .fetch_one(&restarted.state.database)
+            .await
+            .expect("snapshot row is readable after restart");
+    assert_eq!(
+        snapshot_after.0, before.0,
+        "backfill must never rewrite the RFC 3339 receipt/API text"
+    );
+    assert_eq!(
+        snapshot_after.1,
+        crate::database::sort_key_from_rfc3339(&snapshot_after.0).expect("parses")
+    );
+    assert_ne!(snapshot_after.1, 0);
+
+    let capture_after: (String, i64) = sqlx::query_as(
+        "SELECT server_completed_at, server_completed_at_seq FROM captures WHERE snapshot_id = ?1",
+    )
+    .bind(&original.receipt.snapshot_id)
+    .fetch_one(&restarted.state.database)
+    .await
+    .expect("capture row is readable after restart");
+    assert_eq!(
+        capture_after.1,
+        crate::database::sort_key_from_rfc3339(&capture_after.0).expect("parses")
+    );
+    assert_ne!(capture_after.1, 0);
+
+    let artifact_after: (String, i64) =
+        sqlx::query_as("SELECT created_at, created_at_seq FROM artifacts WHERE snapshot_id = ?1")
+            .bind(&original.receipt.snapshot_id)
+            .fetch_one(&restarted.state.database)
+            .await
+            .expect("artifact row is readable after restart");
+    assert_eq!(
+        artifact_after.1,
+        crate::database::sort_key_from_rfc3339(&artifact_after.0).expect("parses")
+    );
+    assert_ne!(artifact_after.1, 0);
+
+    let reissued =
+        complete_upload_for_completion(&restarted, &config, &upload.completion_url).await;
+    assert_eq!(reissued.receipt.snapshot_id, original.receipt.snapshot_id);
+    assert_eq!(reissued.receipt.completed_at, original.receipt.completed_at);
+    assert_eq!(
+        reissued.receipt.manifest_sha256,
+        original.receipt.manifest_sha256
+    );
+    assert_eq!(
+        reissued.receipt.snapshot_fingerprint,
+        original.receipt.snapshot_fingerprint
+    );
+
+    let snapshots: PaginatedResponse<SnapshotSummary> =
+        get_json(&restarted, &config, "/api/v1/snapshots").await;
+    assert_eq!(snapshots.items[0].snapshot_id, original.receipt.snapshot_id);
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn archive_browsing_excludes_incomplete_and_tombstoned_snapshots_after_restart() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    for endpoint in [
+        "/api/v1/sessions",
+        "/api/v1/captures",
+        "/api/v1/snapshots",
+        "/api/v1/manifests",
+        "/api/v1/artifacts",
+    ] {
+        let empty: serde_json::Value = get_json(&service, &config, endpoint).await;
+        assert_eq!(empty["items"], serde_json::json!([]));
+        assert!(empty["next_cursor"].is_null());
+        assert!(empty["high_watermark"].is_null());
+    }
+
+    let pending = create_upload(
+        &service,
+        &config,
+        client_id,
+        "pending-only",
+        manifest_with_context(
+            b"pending",
+            b"pending",
+            "pending-only",
+            "project",
+            "example/pending",
+            "main",
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    let no_completed_sessions: PaginatedResponse<SessionResponse> =
+        get_json(&service, &config, "/api/v1/sessions").await;
+    assert!(no_completed_sessions.items.is_empty());
+    assert!(!pending.upload_id.is_empty());
+
+    let bytes = b"visible archive record";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "visible",
+        manifest_with_context(
+            bytes,
+            bytes,
+            "visible-session",
+            "project",
+            "example/visible",
+            "main",
+            serde_json::json!({"opaque": "preserve-me"}),
+        ),
+        bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let before_restart: SessionResponse = get_json(
+        &service,
+        &config,
+        format!("/api/v1/sessions/{}", completion.receipt.session_id),
+    )
+    .await;
+    assert_eq!(
+        before_restart.latest_snapshot.snapshot_id,
+        completion.receipt.snapshot_id
+    );
+    drop(service);
+
+    let (restarted, _) = Service::bootstrap(&config).await.expect("restarts");
+    let after_restart: SessionResponse = get_json(
+        &restarted,
+        &config,
+        format!("/api/v1/sessions/{}", completion.receipt.session_id),
+    )
+    .await;
+    assert_eq!(after_restart, before_restart);
+    let snapshot: SnapshotResponse = get_json(
+        &restarted,
+        &config,
+        format!("/api/v1/snapshots/{}", completion.receipt.snapshot_id),
+    )
+    .await;
+    let artifact_id = snapshot.artifacts[0].artifact_id.clone();
+
+    sqlx::query("UPDATE snapshots SET deleted_at = ?1 WHERE id = ?2")
+        .bind("2026-07-13T21:00:00Z")
+        .bind(&completion.receipt.snapshot_id)
+        .execute(&restarted.state.database)
+        .await
+        .expect("future tombstone hook is writable for this test");
+    for endpoint in [
+        "/api/v1/sessions",
+        "/api/v1/captures",
+        "/api/v1/snapshots",
+        "/api/v1/manifests",
+        "/api/v1/artifacts",
+    ] {
+        let list: serde_json::Value = get_json(&restarted, &config, endpoint).await;
+        assert_eq!(list["items"], serde_json::json!([]), "{endpoint}");
+    }
+    for endpoint in [
+        format!("/api/v1/snapshots/{}", completion.receipt.snapshot_id),
+        format!("/api/v1/captures/{}", completion.capture.capture_record_id),
+        format!("/api/v1/artifacts/{artifact_id}"),
+    ] {
+        let (status, _, _) = call(
+            restarted.router(&config),
+            Request::builder()
+                .uri(endpoint)
+                .body(Body::empty())
+                .expect("request is valid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }

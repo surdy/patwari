@@ -11,6 +11,7 @@ mod database;
 mod error;
 mod health;
 mod ingestion;
+mod retrieval;
 mod service;
 mod storage;
 mod validation;

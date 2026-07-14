@@ -8,12 +8,11 @@ use std::{
 use axum::{
     Json,
     body::Body,
-    extract::{Path as AxumPath, Query, State, rejection::JsonRejection},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::Response,
+    extract::{Path as AxumPath, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
 };
 use http_body_util::BodyExt;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 use thiserror::Error;
@@ -23,16 +22,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     sync::OwnedMutexGuard,
 };
-use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::{
     config::MAX_CHUNK_COUNT,
     contract::{
-        Artifact, ArtifactResponse, CaptureProvenance, ClientResponse, CompletionResponse,
-        CompletionTransfer, Compression, CreateUploadRequest, LEGACY_ARTIFACT_SET_VERSION,
-        Manifest, Receipt, RegisterClientRequest, SessionInput, SnapshotCapturesResponse,
-        SnapshotResponse, UploadArtifactStatus, UploadResponse, UploadStatus, UploadStatusResponse,
+        Artifact, ClientResponse, CompletionResponse, Compression, CreateUploadRequest,
+        LEGACY_ARTIFACT_SET_VERSION, Manifest, RegisterClientRequest, SessionInput,
+        UploadArtifactStatus, UploadResponse, UploadStatus, UploadStatusResponse,
     },
     database::{self, format_time, now_rfc3339},
     error::{ApiError, classify_database_error, parse_json},
@@ -40,8 +37,7 @@ use crate::{
     storage::StorageLayout,
     validation::{
         ManifestLimits, capture_id, manifest_totals, normalize_manifest, parse_uuid, to_sqlite_i64,
-        validate_capture_identifier, validate_client_request, validate_digest,
-        validate_octet_stream,
+        validate_client_request, validate_digest, validate_octet_stream,
     },
 };
 
@@ -1302,7 +1298,9 @@ pub(crate) async fn complete_upload(
     let _guard = lock.lock().await;
     let upload = require_active_upload(&state, &upload_id).await?;
     if upload.status == "completed" {
-        return completion_for_upload(&state, &upload_id).await.map(Json);
+        return crate::retrieval::completion_for_upload(&state, &upload_id)
+            .await
+            .map(Json);
     }
 
     let manifest = get_upload_manifest(&state.database, &upload_id).await?;
@@ -1338,7 +1336,9 @@ pub(crate) async fn complete_upload(
         )
         .await?;
         let _ = state.storage.remove_upload_dir(&upload_id).await;
-        return completion_for_upload(&state, &upload_id).await.map(Json);
+        return crate::retrieval::completion_for_upload(&state, &upload_id)
+            .await
+            .map(Json);
     }
 
     let unique = unique_stored_artifacts(&prepared);
@@ -1370,7 +1370,9 @@ pub(crate) async fn complete_upload(
         .await?;
         drop(blob_guards);
         let _ = state.storage.remove_upload_dir(&upload_id).await;
-        return completion_for_upload(&state, &upload_id).await.map(Json);
+        return crate::retrieval::completion_for_upload(&state, &upload_id)
+            .await
+            .map(Json);
     }
 
     let promotions = match promote_unique_blobs(&state, &unique).await {
@@ -1417,7 +1419,9 @@ pub(crate) async fn complete_upload(
     // upload-scoped leftovers that bootstrap removes; the snapshot and all
     // of its normalized artifact rows became visible in one transaction.
     let _ = state.storage.remove_upload_dir(&upload_id).await;
-    completion_for_upload(&state, &upload_id).await.map(Json)
+    crate::retrieval::completion_for_upload(&state, &upload_id)
+        .await
+        .map(Json)
 }
 
 fn validate_current_manifest_limits(state: &AppState, manifest: &Manifest) -> Result<(), ApiError> {
@@ -1867,6 +1871,7 @@ async fn record_completed_upload(
     }
 
     let now = now_rfc3339().map_err(|_| ApiError::internal())?;
+    let now_seq = database::sort_key_from_rfc3339(&now).map_err(|_| ApiError::internal())?;
     let mut transaction = state
         .database
         .begin()
@@ -1892,8 +1897,9 @@ async fn record_completed_upload(
     let snapshot_insert = sqlx::query(
         "INSERT INTO snapshots (
             id, owner_namespace, session_id, manifest_id, fingerprint_sha256, completed_at,
-            artifact_count, total_original_size_bytes, total_stored_size_bytes, fingerprint_version
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            completed_at_seq, artifact_count, total_original_size_bytes, total_stored_size_bytes,
+            fingerprint_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(session_id, fingerprint_sha256) DO NOTHING",
     )
     .bind(&candidate_snapshot_id)
@@ -1902,6 +1908,7 @@ async fn record_completed_upload(
     .bind(&manifest_id.0)
     .bind(fingerprint)
     .bind(&now)
+    .bind(now_seq)
     .bind(to_sqlite_i64(
         u64::try_from(prepared.len()).map_err(|_| ApiError::internal())?,
     )?)
@@ -1945,6 +1952,7 @@ async fn record_completed_upload(
         prepared,
         &blob_ids,
         &now,
+        now_seq,
         transfer_bytes,
         newly_persisted_bytes,
     )
@@ -1988,6 +1996,7 @@ async fn finalize_winning_snapshot(
     prepared: &[PreparedArtifact],
     blob_ids: &HashMap<String, String>,
     now: &str,
+    now_seq: i64,
     transfer_bytes: u64,
     newly_persisted_bytes: u64,
 ) -> Result<(), ApiError> {
@@ -1997,8 +2006,8 @@ async fn finalize_winning_snapshot(
         sqlx::query(
             "INSERT INTO artifacts (
                 id, snapshot_id, blob_id, logical_path, media_type, original_size_bytes,
-                original_sha256, created_at, artifact_index
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                original_sha256, created_at, created_at_seq, artifact_index
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(Uuid::now_v7().to_string())
         .bind(snapshot_id)
@@ -2012,6 +2021,7 @@ async fn finalize_winning_snapshot(
             &prepared_artifact.artifact.original_sha256,
         ))
         .bind(now)
+        .bind(now_seq)
         .bind(i64::from(prepared_artifact.artifact_index))
         .execute(&mut **transaction)
         .await
@@ -2072,6 +2082,8 @@ async fn insert_capture_provenance(
     snapshot_id: &str,
     completed_at: &str,
 ) -> Result<(), ApiError> {
+    let completed_at_seq =
+        database::sort_key_from_rfc3339(completed_at).map_err(|_| ApiError::internal())?;
     let metadata_json = serde_json::to_string(&manifest.capture.source_metadata)
         .map_err(|_| ApiError::internal())?;
     let inserted = sqlx::query(
@@ -2079,10 +2091,11 @@ async fn insert_capture_provenance(
             id, owner_namespace, capture_id, session_id, client_id, upload_id, manifest_id,
             snapshot_id, source_captured_at, source_cursor, source_state_hash,
             source_metadata_json, project, repository, branch, source_agent_version,
-            artifact_set_version, munshi_version, server_received_at, server_completed_at
+            artifact_set_version, munshi_version, server_received_at, server_completed_at,
+            server_completed_at_seq
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-            ?17, ?18, ?19, ?20
+            ?17, ?18, ?19, ?20, ?21
          )
          ON CONFLICT(upload_id) DO NOTHING",
     )
@@ -2106,11 +2119,18 @@ async fn insert_capture_provenance(
     .bind(&manifest.capture.munshi_version)
     .bind(&upload.created_at)
     .bind(completed_at)
+    .bind(completed_at_seq)
     .execute(&mut **transaction)
     .await
     .map_err(|_| ApiError::database())?;
     if inserted.rows_affected() == 1 {
-        return Ok(());
+        return maintain_session_latest_context(
+            transaction,
+            &upload.session_id,
+            snapshot_id,
+            manifest,
+        )
+        .await;
     }
 
     let existing: Option<(String, String)> =
@@ -2120,13 +2140,87 @@ async fn insert_capture_provenance(
             .await
             .map_err(|_| ApiError::database())?;
     if existing.is_some_and(|existing| existing.0 == upload.id && existing.1 == snapshot_id) {
-        Ok(())
+        maintain_session_latest_context(transaction, &upload.session_id, snapshot_id, manifest)
+            .await
     } else {
         Err(ApiError::conflict(
             "capture_provenance_conflict",
             "capture provenance conflicts with an existing completed capture",
         ))
     }
+}
+
+/// Keeps a rebuildable latest-snapshot projection in the same transaction as
+/// successful capture provenance. The historical capture rows and manifests
+/// are never overwritten; this merely selects the greatest immutable snapshot
+/// completion tuple for session-list filtering.
+async fn maintain_session_latest_context(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    snapshot_id: &str,
+    manifest: &Manifest,
+) -> Result<(), ApiError> {
+    let completed_at: (String,) =
+        sqlx::query_as("SELECT completed_at FROM snapshots WHERE id = ?1 AND deleted_at IS NULL")
+            .bind(snapshot_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| ApiError::database())?
+            .ok_or_else(ApiError::internal)?;
+    upsert_session_latest_context(
+        transaction,
+        session_id,
+        snapshot_id,
+        &completed_at.0,
+        manifest,
+    )
+    .await
+}
+
+async fn upsert_session_latest_context(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    snapshot_id: &str,
+    completed_at: &str,
+    manifest: &Manifest,
+) -> Result<(), ApiError> {
+    let completed_at_seq =
+        database::sort_key_from_rfc3339(completed_at).map_err(|_| ApiError::internal())?;
+    sqlx::query(
+        "INSERT INTO session_latest_context (
+            session_id, snapshot_id, completed_at, completed_at_seq, source_agent, project,
+            repository, branch, source_agent_version, artifact_set_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(session_id) DO UPDATE SET
+            snapshot_id = excluded.snapshot_id,
+            completed_at = excluded.completed_at,
+            completed_at_seq = excluded.completed_at_seq,
+            source_agent = excluded.source_agent,
+            project = excluded.project,
+            repository = excluded.repository,
+            branch = excluded.branch,
+            source_agent_version = excluded.source_agent_version,
+            artifact_set_version = excluded.artifact_set_version
+         WHERE excluded.completed_at_seq > session_latest_context.completed_at_seq
+            OR (
+                excluded.completed_at_seq = session_latest_context.completed_at_seq
+                AND excluded.snapshot_id > session_latest_context.snapshot_id
+            )",
+    )
+    .bind(session_id)
+    .bind(snapshot_id)
+    .bind(completed_at)
+    .bind(completed_at_seq)
+    .bind(&manifest.session.source_agent)
+    .bind(&manifest.capture.project)
+    .bind(&manifest.capture.repository)
+    .bind(&manifest.capture.branch)
+    .bind(&manifest.capture.source_agent_version)
+    .bind(i64::from(manifest.capture.artifact_set_version))
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::database())?;
+    Ok(())
 }
 
 async fn ensure_blob_representations_compatible(
@@ -2462,56 +2556,6 @@ pub(crate) fn snapshot_fingerprint(manifest: &Manifest) -> Result<String, ApiErr
         .map_err(|_| ApiError::internal())
 }
 
-pub(crate) async fn get_snapshot(
-    AxumPath(snapshot_id): AxumPath<String>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
-    let snapshot_id = parse_uuid(&snapshot_id, "snapshot identifier is not a UUID")?.to_string();
-    snapshot_response(&state.database, &snapshot_id)
-        .await
-        .map(Json)
-}
-
-pub(crate) async fn download_artifact(
-    AxumPath(artifact_id): AxumPath<String>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Response, ApiError> {
-    let artifact_id = parse_uuid(&artifact_id, "artifact identifier is not a UUID")?.to_string();
-    let row = sqlx::query_as::<_, DownloadRow>(
-        "SELECT a.id, b.stored_sha256, b.stored_size_bytes
-         FROM artifacts a JOIN blobs b ON b.id = a.blob_id
-         WHERE a.id = ?1",
-    )
-    .bind(&artifact_id)
-    .fetch_optional(&state.database)
-    .await
-    .map_err(|_| ApiError::database())?
-    .ok_or_else(|| ApiError::not_found("artifact_not_found", "artifact was not found"))?;
-    let path = state.storage.blob_path(&row.stored_sha256);
-    if !is_regular_file(&path).await {
-        return Err(ApiError::storage());
-    }
-    let file = fs::File::open(path)
-        .await
-        .map_err(|_| ApiError::storage())?;
-    let size = u64::try_from(row.stored_size_bytes).map_err(|_| ApiError::internal())?;
-    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&size.to_string()).map_err(|_| ApiError::internal())?,
-    );
-    response.headers_mut().insert(
-        "x-patwari-stored-sha256",
-        HeaderValue::from_str(&digest_document_value(&row.stored_sha256))
-            .map_err(|_| ApiError::internal())?,
-    );
-    Ok(response)
-}
-
 async fn get_upload_manifest(database: &SqlitePool, upload_id: &str) -> Result<Manifest, ApiError> {
     let row: (String,) =
         sqlx::query_as("SELECT canonical_json FROM manifests WHERE upload_id = ?1")
@@ -2520,287 +2564,6 @@ async fn get_upload_manifest(database: &SqlitePool, upload_id: &str) -> Result<M
             .await
             .map_err(|_| ApiError::database())?;
     serde_json::from_str(&row.0).map_err(|_| ApiError::internal())
-}
-
-async fn receipt_for_upload(state: &AppState, upload_id: &str) -> Result<Receipt, ApiError> {
-    let row = sqlx::query_as::<_, ReceiptRow>(
-        "SELECT s.id, s.session_id, s.fingerprint_sha256, s.completed_at,
-                m.sha256 AS manifest_sha256, s.artifact_count,
-                s.total_original_size_bytes, s.total_stored_size_bytes
-         FROM uploads u
-         JOIN snapshots s ON s.id = u.snapshot_id
-         JOIN manifests m ON m.id = s.manifest_id
-         WHERE u.id = ?1 AND u.status = 'completed'",
-    )
-    .bind(upload_id)
-    .fetch_optional(&state.database)
-    .await
-    .map_err(|_| ApiError::database())?
-    .ok_or_else(|| ApiError::not_found("snapshot_not_found", "snapshot was not found"))?;
-    Ok(Receipt {
-        receipt_version: 2,
-        archive_instance_id: state.identity.archive_instance_id.clone(),
-        owner_namespace: state.identity.owner_namespace.clone(),
-        snapshot_id: row.id,
-        session_id: row.session_id,
-        snapshot_fingerprint: digest_document_value(&row.fingerprint_sha256),
-        manifest_sha256: digest_document_value(&row.manifest_sha256),
-        artifact_count: u32::try_from(row.artifact_count).map_err(|_| ApiError::internal())?,
-        total_original_bytes: u64::try_from(row.total_original_size_bytes)
-            .map_err(|_| ApiError::internal())?,
-        total_stored_bytes: u64::try_from(row.total_stored_size_bytes)
-            .map_err(|_| ApiError::internal())?,
-        completed_at: row.completed_at,
-    })
-}
-
-async fn completion_for_upload(
-    state: &AppState,
-    upload_id: &str,
-) -> Result<CompletionResponse, ApiError> {
-    let receipt = receipt_for_upload(state, upload_id).await?;
-    let transfer = sqlx::query_as::<_, CompletionTransferRow>(
-        "SELECT id, capture_id, transfer_bytes, newly_persisted_bytes
-         FROM uploads WHERE id = ?1 AND status = 'completed'",
-    )
-    .bind(upload_id)
-    .fetch_optional(&state.database)
-    .await
-    .map_err(|_| ApiError::database())?
-    .ok_or_else(|| ApiError::not_found("upload_not_found", "upload was not found"))?;
-    let capture = capture_for_upload(&state.database, upload_id).await?;
-    Ok(CompletionResponse {
-        receipt,
-        transfer: CompletionTransfer {
-            upload_id: transfer.id,
-            capture_id: transfer.capture_id,
-            upload_transfer_bytes: u64::try_from(transfer.transfer_bytes)
-                .map_err(|_| ApiError::internal())?,
-            newly_persisted_physical_bytes: u64::try_from(transfer.newly_persisted_bytes)
-                .map_err(|_| ApiError::internal())?,
-        },
-        capture,
-    })
-}
-
-pub(crate) async fn get_capture_by_upload(
-    AxumPath(upload_id): AxumPath<String>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<CaptureProvenance>, ApiError> {
-    let upload_id = parse_uuid(&upload_id, "upload identifier is not a UUID")?.to_string();
-    capture_for_upload(&state.database, &upload_id)
-        .await
-        .map(Json)
-}
-
-pub(crate) async fn get_capture(
-    AxumPath(capture_record_id): AxumPath<String>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<CaptureProvenance>, ApiError> {
-    let capture_record_id = parse_uuid(
-        &capture_record_id,
-        "capture record identifier is not a UUID",
-    )?
-    .to_string();
-    let query = format!("{} WHERE c.id = ?1", capture_select_sql());
-    capture_from_row(
-        sqlx::query_as::<_, CaptureRow>(&query)
-            .bind(&capture_record_id)
-            .fetch_optional(&state.database)
-            .await
-            .map_err(|_| ApiError::database())?
-            .ok_or_else(|| ApiError::not_found("capture_not_found", "capture was not found"))?,
-    )
-    .map(Json)
-}
-
-#[derive(Deserialize)]
-pub(crate) struct CaptureLookup {
-    client_id: String,
-    capture_id: String,
-}
-
-/// Retrieves one capture by the pair that gives a client-generated capture
-/// ID its owner-local meaning. A bare client capture ID is intentionally not
-/// a global key because different clients may independently generate it.
-pub(crate) async fn get_capture_by_client(
-    State(state): State<Arc<AppState>>,
-    Query(lookup): Query<CaptureLookup>,
-) -> Result<Json<CaptureProvenance>, ApiError> {
-    let client_id = parse_uuid(&lookup.client_id, "client identifier is not a UUID")?.to_string();
-    validate_capture_identifier(&lookup.capture_id)?;
-    let query = format!(
-        "{} WHERE c.client_id = ?1 AND c.capture_id = ?2",
-        capture_select_sql()
-    );
-    capture_from_row(
-        sqlx::query_as::<_, CaptureRow>(&query)
-            .bind(client_id)
-            .bind(lookup.capture_id)
-            .fetch_optional(&state.database)
-            .await
-            .map_err(|_| ApiError::database())?
-            .ok_or_else(|| ApiError::not_found("capture_not_found", "capture was not found"))?,
-    )
-    .map(Json)
-}
-
-pub(crate) async fn get_snapshot_captures(
-    AxumPath(snapshot_id): AxumPath<String>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<SnapshotCapturesResponse>, ApiError> {
-    let snapshot_id = parse_uuid(&snapshot_id, "snapshot identifier is not a UUID")?.to_string();
-    let snapshot_exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM snapshots WHERE id = ?1")
-        .bind(&snapshot_id)
-        .fetch_optional(&state.database)
-        .await
-        .map_err(|_| ApiError::database())?;
-    if snapshot_exists.is_none() {
-        return Err(ApiError::not_found(
-            "snapshot_not_found",
-            "snapshot was not found",
-        ));
-    }
-    let rows = sqlx::query_as::<_, CaptureRow>(&format!(
-        "{} WHERE c.snapshot_id = ?1 ORDER BY c.server_completed_at, c.id",
-        capture_select_sql()
-    ))
-    .bind(&snapshot_id)
-    .fetch_all(&state.database)
-    .await
-    .map_err(|_| ApiError::database())?;
-    let captures = rows
-        .into_iter()
-        .map(capture_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(SnapshotCapturesResponse {
-        snapshot_id,
-        captures,
-    }))
-}
-
-async fn capture_for_upload(
-    database: &SqlitePool,
-    upload_id: &str,
-) -> Result<CaptureProvenance, ApiError> {
-    capture_from_row(
-        sqlx::query_as::<_, CaptureRow>(&format!(
-            "{} WHERE c.upload_id = ?1",
-            capture_select_sql()
-        ))
-        .bind(upload_id)
-        .fetch_optional(database)
-        .await
-        .map_err(|_| ApiError::database())?
-        .ok_or_else(|| ApiError::not_found("capture_not_found", "capture was not found"))?,
-    )
-}
-
-fn capture_select_sql() -> &'static str {
-    "SELECT c.id, c.capture_id, c.client_id, c.session_id, c.upload_id, c.snapshot_id,
-            m.sha256 AS manifest_sha256, c.source_captured_at, c.source_cursor,
-            c.source_state_hash, c.source_metadata_json, c.project, c.repository, c.branch,
-            c.source_agent_version, c.artifact_set_version, c.munshi_version,
-            c.server_received_at, c.server_completed_at
-     FROM captures c JOIN manifests m ON m.id = c.manifest_id"
-}
-
-fn capture_from_row(row: CaptureRow) -> Result<CaptureProvenance, ApiError> {
-    let source_metadata =
-        serde_json::from_str(&row.source_metadata_json).map_err(|_| ApiError::internal())?;
-    Ok(CaptureProvenance {
-        capture_url: format!("/api/v1/captures/{}", row.id),
-        capture_record_id: row.id,
-        capture_id: row.capture_id,
-        client_id: row.client_id,
-        session_id: row.session_id,
-        upload_id: row.upload_id,
-        snapshot_id: row.snapshot_id,
-        manifest_sha256: digest_document_value(&row.manifest_sha256),
-        source_captured_at: row.source_captured_at,
-        source_cursor: row.source_cursor,
-        source_state_hash: row.source_state_hash,
-        source_metadata,
-        project: row.project,
-        repository: row.repository,
-        branch: row.branch,
-        source_agent_version: row.source_agent_version,
-        artifact_set_version: u16::try_from(row.artifact_set_version)
-            .map_err(|_| ApiError::internal())?,
-        munshi_version: row.munshi_version,
-        server_received_at: row.server_received_at,
-        server_completed_at: row.server_completed_at,
-    })
-}
-
-async fn snapshot_response(
-    database: &SqlitePool,
-    snapshot_id: &str,
-) -> Result<SnapshotResponse, ApiError> {
-    let row = sqlx::query_as::<_, SnapshotRow>(
-        "SELECT s.id, s.session_id, s.fingerprint_sha256, s.completed_at,
-                s.artifact_count, s.total_original_size_bytes, s.total_stored_size_bytes,
-                m.sha256 AS manifest_sha256, m.canonical_json,
-                (SELECT COUNT(*) FROM captures c WHERE c.snapshot_id = s.id) AS capture_count
-         FROM snapshots s JOIN manifests m ON m.id = s.manifest_id
-         WHERE s.id = ?1",
-    )
-    .bind(snapshot_id)
-    .fetch_optional(database)
-    .await
-    .map_err(|_| ApiError::database())?
-    .ok_or_else(|| ApiError::not_found("snapshot_not_found", "snapshot was not found"))?;
-    reconcile_snapshot(database, snapshot_id)
-        .await
-        .map_err(|_| ApiError::internal())?;
-    let manifest: Manifest =
-        serde_json::from_str(&row.canonical_json).map_err(|_| ApiError::internal())?;
-    let artifacts = sqlx::query_as::<_, ArtifactRow>(
-        "SELECT a.id, a.artifact_index, a.logical_path, a.media_type, a.original_size_bytes, a.original_sha256,
-                b.stored_size_bytes, b.stored_sha256, b.compression
-         FROM artifacts a JOIN blobs b ON b.id = a.blob_id WHERE a.snapshot_id = ?1
-         ORDER BY a.artifact_index",
-    )
-    .bind(snapshot_id)
-    .fetch_all(database)
-    .await
-    .map_err(|_| ApiError::database())?
-    .into_iter()
-    .map(artifact_response)
-    .collect::<Result<Vec<_>, _>>()?;
-    Ok(SnapshotResponse {
-        snapshot_id: row.id,
-        session_id: row.session_id,
-        snapshot_fingerprint: digest_document_value(&row.fingerprint_sha256),
-        manifest_sha256: digest_document_value(&row.manifest_sha256),
-        completed_at: row.completed_at,
-        artifact_count: u32::try_from(row.artifact_count).map_err(|_| ApiError::internal())?,
-        total_original_bytes: u64::try_from(row.total_original_size_bytes)
-            .map_err(|_| ApiError::internal())?,
-        total_stored_bytes: u64::try_from(row.total_stored_size_bytes)
-            .map_err(|_| ApiError::internal())?,
-        capture_count: u64::try_from(row.capture_count).map_err(|_| ApiError::internal())?,
-        captures_url: format!("/api/v1/snapshots/{snapshot_id}/captures"),
-        manifest,
-        artifacts,
-    })
-}
-
-fn artifact_response(row: ArtifactRow) -> Result<ArtifactResponse, ApiError> {
-    Ok(ArtifactResponse {
-        content_url: format!("/api/v1/artifacts/{}/content", row.id),
-        artifact_id: row.id,
-        artifact_index: u32::try_from(row.artifact_index).map_err(|_| ApiError::internal())?,
-        logical_path: row.logical_path,
-        media_type: row.media_type,
-        original_size_bytes: u64::try_from(row.original_size_bytes)
-            .map_err(|_| ApiError::internal())?,
-        original_sha256: digest_document_value(&row.original_sha256),
-        stored_size_bytes: u64::try_from(row.stored_size_bytes)
-            .map_err(|_| ApiError::internal())?,
-        stored_sha256: digest_document_value(&row.stored_sha256),
-        compression: parse_compression(&row.compression).map_err(|()| ApiError::internal())?,
-    })
 }
 
 fn chunk_count(stored_size: u64, chunk_size: u64) -> Result<u64, ApiError> {
@@ -3035,82 +2798,6 @@ struct BlobRow {
     compression: String,
 }
 
-#[derive(FromRow)]
-struct ReceiptRow {
-    id: String,
-    session_id: String,
-    fingerprint_sha256: String,
-    manifest_sha256: String,
-    completed_at: String,
-    artifact_count: i64,
-    total_original_size_bytes: i64,
-    total_stored_size_bytes: i64,
-}
-
-#[derive(FromRow)]
-struct CompletionTransferRow {
-    id: String,
-    capture_id: String,
-    transfer_bytes: i64,
-    newly_persisted_bytes: i64,
-}
-
-#[derive(FromRow)]
-struct CaptureRow {
-    id: String,
-    capture_id: String,
-    client_id: String,
-    session_id: String,
-    upload_id: String,
-    snapshot_id: String,
-    manifest_sha256: String,
-    source_captured_at: String,
-    source_cursor: Option<String>,
-    source_state_hash: Option<String>,
-    source_metadata_json: String,
-    project: Option<String>,
-    repository: Option<String>,
-    branch: Option<String>,
-    source_agent_version: Option<String>,
-    artifact_set_version: i64,
-    munshi_version: Option<String>,
-    server_received_at: String,
-    server_completed_at: String,
-}
-
-#[derive(FromRow)]
-struct SnapshotRow {
-    id: String,
-    session_id: String,
-    fingerprint_sha256: String,
-    manifest_sha256: String,
-    completed_at: String,
-    artifact_count: i64,
-    total_original_size_bytes: i64,
-    total_stored_size_bytes: i64,
-    canonical_json: String,
-    capture_count: i64,
-}
-
-#[derive(FromRow)]
-struct ArtifactRow {
-    id: String,
-    artifact_index: i64,
-    logical_path: String,
-    media_type: Option<String>,
-    original_size_bytes: i64,
-    original_sha256: String,
-    stored_size_bytes: i64,
-    stored_sha256: String,
-    compression: String,
-}
-
-#[derive(FromRow)]
-struct DownloadRow {
-    stored_sha256: String,
-    stored_size_bytes: i64,
-}
-
 /// Reconciles file-first upload persistence after a restart. New multi-artifact
 /// projection rows are installed before status recovery, then each artifact's
 /// accepted chunks are checked independently.
@@ -3118,7 +2805,9 @@ pub(crate) async fn recover_uploads(state: &AppState) -> Result<(), MaintenanceE
     upgrade_upload_artifact_rows(state).await?;
     upgrade_legacy_uploads(state).await?;
     upgrade_snapshot_fingerprints(state).await?;
+    backfill_sort_keys(state).await?;
     backfill_completed_capture_provenance(state).await?;
+    rebuild_session_latest_context(state).await?;
     let uploads = sqlx::query_as::<_, RecoveryUploadRow>("SELECT id, status FROM uploads")
         .fetch_all(&state.database)
         .await
@@ -3194,6 +2883,78 @@ async fn upgrade_snapshot_fingerprints(state: &AppState) -> Result<(), Maintenan
     Ok(())
 }
 
+#[derive(FromRow)]
+struct SortKeyBackfillRow {
+    id: String,
+    source_timestamp: String,
+}
+
+/// Backfills the numeric ordering key (see `database::sort_key_from_rfc3339`)
+/// for snapshot, capture, and artifact rows written before that column
+/// existed. New rows always set it transactionally alongside their other
+/// immutable fields (see `record_completed_upload` and
+/// `insert_capture_provenance`); this is a one-time repair path for earlier
+/// schema versions, mirroring `upgrade_snapshot_fingerprints`. It only
+/// parses the existing RFC 3339 receipt/API text to derive the numeric key
+/// and never rewrites that text.
+async fn backfill_sort_keys(state: &AppState) -> Result<(), MaintenanceError> {
+    backfill_table_sort_key(state, "snapshots", "completed_at", "completed_at_seq").await?;
+    backfill_table_sort_key(
+        state,
+        "captures",
+        "server_completed_at",
+        "server_completed_at_seq",
+    )
+    .await?;
+    backfill_table_sort_key(state, "artifacts", "created_at", "created_at_seq").await?;
+    Ok(())
+}
+
+/// `table`, `timestamp_column`, and `sort_key_column` are always fixed
+/// internal identifiers (never user input), so building SQL text from them
+/// is safe; this mirrors the dynamic column names already built from
+/// trusted constants in `retrieval::append_descending_bounds`.
+async fn backfill_table_sort_key(
+    state: &AppState,
+    table: &'static str,
+    timestamp_column: &'static str,
+    sort_key_column: &'static str,
+) -> Result<(), MaintenanceError> {
+    let select = format!(
+        "SELECT id, {timestamp_column} AS source_timestamp FROM {table}
+         WHERE {sort_key_column} = 0"
+    );
+    let rows = sqlx::query_as::<_, SortKeyBackfillRow>(&select)
+        .fetch_all(&state.database)
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let update = format!(
+        "UPDATE {table} SET {sort_key_column} = ?1 WHERE id = ?2 AND {sort_key_column} = 0"
+    );
+    let mut transaction = state
+        .database
+        .begin()
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    for row in rows {
+        let sort_key = database::sort_key_from_rfc3339(&row.source_timestamp)
+            .map_err(|_| MaintenanceError::Operation)?;
+        sqlx::query(&update)
+            .bind(sort_key)
+            .bind(&row.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| MaintenanceError::Operation)
+}
+
 async fn backfill_completed_capture_provenance(state: &AppState) -> Result<(), MaintenanceError> {
     let upload_ids = sqlx::query_as::<_, (String,)>(
         "SELECT u.id
@@ -3247,6 +3008,70 @@ async fn backfill_completed_capture_provenance(state: &AppState) -> Result<(), M
             .map_err(|_| MaintenanceError::Operation)?;
     }
     Ok(())
+}
+
+/// Rebuilds the browsing projection with one set-based statement over
+/// normalized session/snapshot/capture rows. This intentionally runs at
+/// bootstrap as a backfill/repair path, while normal completion maintains
+/// the same projection transactionally (see `maintain_session_latest_context`).
+///
+/// It never buffers manifests or per-session state in Rust: for each
+/// session it selects the latest non-tombstoned snapshot by the numeric
+/// completion sort key (falling back to the `UUIDv7` snapshot id, which is
+/// itself chronologically monotonic, to break exact ties), then joins one
+/// of that snapshot's captures for the session's stable cross-agent
+/// context fields. When distinct captures coalesce onto the same snapshot
+/// (identical fingerprint-stable fields, by construction - see
+/// `snapshot_fingerprint`), any one of them yields the same project,
+/// repository, branch, source agent version, and artifact set version, so
+/// picking the smallest capture id keeps the choice deterministic without
+/// affecting the projected values.
+async fn rebuild_session_latest_context(state: &AppState) -> Result<(), MaintenanceError> {
+    let mut transaction = state
+        .database
+        .begin()
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    sqlx::query("DELETE FROM session_latest_context")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    sqlx::query(
+        "INSERT INTO session_latest_context (
+            session_id, snapshot_id, completed_at, completed_at_seq, source_agent,
+            project, repository, branch, source_agent_version, artifact_set_version
+         )
+         SELECT session_id, snapshot_id, completed_at, completed_at_seq, source_agent,
+                project, repository, branch, source_agent_version, artifact_set_version
+         FROM (
+             SELECT
+                 sess.id AS session_id,
+                 snap.id AS snapshot_id,
+                 snap.completed_at AS completed_at,
+                 snap.completed_at_seq AS completed_at_seq,
+                 sess.source_agent AS source_agent,
+                 cap.project AS project,
+                 cap.repository AS repository,
+                 cap.branch AS branch,
+                 cap.source_agent_version AS source_agent_version,
+                 cap.artifact_set_version AS artifact_set_version,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY sess.id
+                     ORDER BY snap.completed_at_seq DESC, snap.id DESC, cap.id ASC
+                 ) AS context_rank
+             FROM sessions sess
+             JOIN snapshots snap ON snap.session_id = sess.id AND snap.deleted_at IS NULL
+             JOIN captures cap ON cap.snapshot_id = snap.id
+         ) ranked
+         WHERE ranked.context_rank = 1",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| MaintenanceError::Operation)
 }
 
 #[derive(FromRow)]

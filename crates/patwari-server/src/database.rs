@@ -111,6 +111,24 @@ pub(crate) fn format_time(timestamp: OffsetDateTime) -> Result<String, time::err
     timestamp.format(&Rfc3339)
 }
 
+/// RFC 3339 timestamps have a variable-precision fractional-second component
+/// (for example `.12Z` sorts after `.123Z` as TEXT even though it is
+/// chronologically earlier), so comparing the receipt/API text does not
+/// preserve chronological order. This immutable numeric ordering key -
+/// signed 64-bit microseconds since the Unix epoch (UTC) - is what every
+/// keyset-paginated table sorts and filters by; the RFC 3339 column remains
+/// the unmodified documented display/receipt format alongside it.
+pub(crate) fn sort_key_from_timestamp(timestamp: OffsetDateTime) -> i64 {
+    i64::try_from(timestamp.unix_timestamp_nanos() / 1_000)
+        .expect("microsecond timestamps fit a signed 64-bit integer until the year 294247")
+}
+
+/// Parses a stored or client-supplied RFC 3339 timestamp into its numeric
+/// ordering key without altering the original text.
+pub(crate) fn sort_key_from_rfc3339(value: &str) -> Result<i64, time::error::Parse> {
+    OffsetDateTime::parse(value, &Rfc3339).map(sort_key_from_timestamp)
+}
+
 pub(crate) fn expiration_at(
     now: OffsetDateTime,
     duration: std::time::Duration,

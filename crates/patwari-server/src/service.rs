@@ -18,7 +18,7 @@ use tracing::Level;
 use crate::{
     config::{Config, ConfigError},
     database::{self},
-    health, ingestion,
+    health, ingestion, retrieval,
     storage::StorageLayout,
 };
 
@@ -326,21 +326,46 @@ impl Service {
             )
             .route(
                 "/uploads/{upload_id}/capture",
-                get(ingestion::get_capture_by_upload),
+                get(retrieval::get_capture_by_upload),
             )
-            .route("/captures", get(ingestion::get_capture_by_client))
-            .route("/captures/{capture_record_id}", get(ingestion::get_capture))
+            .route("/sessions", get(retrieval::list_sessions))
+            .route("/sessions/{session_id}", get(retrieval::get_session))
+            .route(
+                "/sessions/{session_id}/captures",
+                get(retrieval::list_session_captures),
+            )
+            .route(
+                "/sessions/{session_id}/snapshots",
+                get(retrieval::list_session_snapshots),
+            )
+            .route("/captures", get(retrieval::captures))
+            .route("/captures/{capture_record_id}", get(retrieval::get_capture))
+            .route("/snapshots", get(retrieval::list_snapshots))
             .route(
                 "/snapshots/{snapshot_id}",
-                get(ingestion::get_snapshot),
+                get(retrieval::get_snapshot),
             )
             .route(
                 "/snapshots/{snapshot_id}/captures",
-                get(ingestion::get_snapshot_captures),
+                get(retrieval::get_snapshot_captures),
+            )
+            .route(
+                "/snapshots/{snapshot_id}/manifest",
+                get(retrieval::get_snapshot_manifest),
+            )
+            .route("/manifests", get(retrieval::list_manifests))
+            .route(
+                "/manifests/{manifest_id}",
+                get(retrieval::get_manifest),
+            )
+            .route("/artifacts", get(retrieval::list_artifacts))
+            .route(
+                "/artifacts/{artifact_id}",
+                get(retrieval::get_artifact_metadata),
             )
             .route(
                 "/artifacts/{artifact_id}/content",
-                get(ingestion::download_artifact),
+                get(retrieval::download_artifact),
             )
             .fallback(health::api_not_found)
             .layer(

@@ -260,6 +260,7 @@ pub struct SnapshotResponse {
     pub snapshot_id: String,
     pub session_id: String,
     pub snapshot_fingerprint: String,
+    pub manifest_id: String,
     pub manifest_sha256: String,
     pub completed_at: String,
     pub artifact_count: u32,
@@ -267,6 +268,7 @@ pub struct SnapshotResponse {
     pub total_stored_bytes: u64,
     pub capture_count: u64,
     pub captures_url: String,
+    pub manifest_url: String,
     pub manifest: Manifest,
     pub artifacts: Vec<ArtifactResponse>,
 }
@@ -282,6 +284,7 @@ pub struct ArtifactResponse {
     pub stored_size_bytes: u64,
     pub stored_sha256: String,
     pub compression: Compression,
+    pub metadata_url: String,
     pub content_url: String,
 }
 
@@ -320,6 +323,7 @@ pub struct CaptureProvenance {
     pub session_id: String,
     pub upload_id: String,
     pub snapshot_id: String,
+    pub manifest_id: String,
     pub manifest_sha256: String,
     pub source_captured_at: String,
     pub source_cursor: Option<String>,
@@ -334,6 +338,7 @@ pub struct CaptureProvenance {
     pub server_received_at: String,
     pub server_completed_at: String,
     pub capture_url: String,
+    pub manifest_url: String,
 }
 
 /// Completion keeps immutable snapshot evidence separate from mutable
@@ -345,12 +350,131 @@ pub struct CompletionResponse {
     pub capture: CaptureProvenance,
 }
 
-/// Focused provenance relation for one snapshot. This is intentionally not a
-/// general capture listing or pagination surface.
+/// Focused paginated provenance relation for one snapshot. The field name is
+/// retained for compatibility with the original focused relation response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotCapturesResponse {
     pub snapshot_id: String,
     pub captures: Vec<CaptureProvenance>,
+    pub next_cursor: Option<String>,
+    pub high_watermark: Option<PageHighWatermark>,
+}
+
+/// An immutable boundary from the fixed descending order used by a paginated
+/// archive collection. It is informational; clients must use `next_cursor`
+/// rather than construct a cursor from these fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageHighWatermark {
+    pub timestamp: String,
+    pub id: String,
+}
+
+/// A page from an archive collection. Collections are ordered descending by
+/// their documented server timestamp and then ID. A cursor carries the first
+/// page's high-watermark, so records completed after that boundary are not
+/// interleaved into an in-progress traversal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PaginatedResponse<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub high_watermark: Option<PageHighWatermark>,
+}
+
+/// Immutable context from the latest completed snapshot projected onto a
+/// session for archive browsing. It does not replace historical capture or
+/// snapshot context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLatestSnapshot {
+    pub snapshot_id: String,
+    pub completed_at: String,
+    pub project: Option<String>,
+    pub repository: Option<String>,
+    pub branch: Option<String>,
+    pub source_agent_version: Option<String>,
+    pub artifact_set_version: u16,
+    pub snapshot_url: String,
+    pub manifest_url: String,
+}
+
+/// A logical source session with context from its latest completed snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResponse {
+    pub session_id: String,
+    pub source_agent: String,
+    pub source_session_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub latest_snapshot: SessionLatestSnapshot,
+    pub captures_url: String,
+    pub snapshots_url: String,
+}
+
+/// Lightweight immutable evidence for one completed snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSummary {
+    pub snapshot_id: String,
+    pub session_id: String,
+    pub snapshot_fingerprint: String,
+    pub manifest_id: String,
+    pub manifest_sha256: String,
+    pub completed_at: String,
+    pub artifact_count: u32,
+    pub total_original_bytes: u64,
+    pub total_stored_bytes: u64,
+    pub capture_count: u64,
+    pub snapshot_url: String,
+    pub captures_url: String,
+    pub manifest_url: String,
+}
+
+/// An immutable canonical manifest retained for one completed capture.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CanonicalManifestResponse {
+    pub manifest_id: String,
+    pub snapshot_id: String,
+    pub session_id: String,
+    pub capture_record_id: String,
+    pub sha256: String,
+    pub created_at: String,
+    pub completed_at: String,
+    pub snapshot_url: String,
+    pub capture_url: String,
+    pub manifest_url: String,
+    pub manifest: Manifest,
+}
+
+/// Metadata for a canonical manifest without duplicating its document.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalManifestSummary {
+    pub manifest_id: String,
+    pub snapshot_id: String,
+    pub session_id: String,
+    pub capture_record_id: String,
+    pub sha256: String,
+    pub created_at: String,
+    pub completed_at: String,
+    pub snapshot_url: String,
+    pub capture_url: String,
+    pub manifest_url: String,
+}
+
+/// Inspectable immutable metadata for a stored artifact. Content remains a
+/// separate streaming resource.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactMetadataResponse {
+    pub artifact_id: String,
+    pub snapshot_id: String,
+    pub artifact_index: u32,
+    pub logical_path: String,
+    pub media_type: Option<String>,
+    pub original_size_bytes: u64,
+    pub original_sha256: String,
+    pub stored_size_bytes: u64,
+    pub stored_sha256: String,
+    pub compression: Compression,
+    pub created_at: String,
+    pub metadata_url: String,
+    pub content_url: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
