@@ -18,12 +18,13 @@ use tracing::Level;
 use crate::{
     config::{Config, ConfigError},
     database::{self},
-    deletion, health, ingestion, retrieval,
+    deletion, health, ingestion, integrity, retrieval,
     storage::StorageLayout,
 };
 
 pub use crate::database::{ArchiveIdentity, BootstrapError};
 pub use crate::ingestion::ReconciliationError;
+pub use crate::integrity::IntegrityScanError;
 
 #[derive(Debug, Error)]
 pub enum MaintenanceError {
@@ -58,6 +59,7 @@ pub(crate) struct AppState {
     pub(crate) database: SqlitePool,
     pub(crate) storage: StorageLayout,
     pub(crate) identity: ArchiveIdentity,
+    pub(crate) max_request_body_bytes: usize,
     pub(crate) chunk_size_bytes: u64,
     pub(crate) max_artifact_stored_bytes: u64,
     pub(crate) max_artifact_original_bytes: u64,
@@ -67,6 +69,8 @@ pub(crate) struct AppState {
     pub(crate) upload_expiry: std::time::Duration,
     pub(crate) admin_deletion_enabled: bool,
     pub(crate) blob_gc_grace: std::time::Duration,
+    pub(crate) integrity_scan_concurrency: usize,
+    pub(crate) integrity_scan_buffer_bytes: usize,
     /// Held by each response body, rather than only by its request handler,
     /// so the cap covers clients that read slowly or stop reading entirely.
     pub(crate) download_permits: Arc<Semaphore>,
@@ -351,6 +355,30 @@ impl Service {
     /// Returns an error when the persistent volume, metadata schema, or upload
     /// recovery state cannot be used safely.
     pub async fn bootstrap(config: &Config) -> Result<(Self, ArchiveIdentity), BootstrapError> {
+        Self::bootstrap_with_recovery(config, true).await
+    }
+
+    /// Creates an archive service for an offline integrity observation.
+    ///
+    /// Unlike normal server bootstrap, this intentionally does not run
+    /// destructive upload/blob recovery. A maintenance scan must be able to
+    /// report an unexpected canonical blob file rather than erase that
+    /// evidence before the scan begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when configuration, persistent storage, or metadata
+    /// schema initialization cannot safely complete.
+    pub async fn bootstrap_for_integrity(
+        config: &Config,
+    ) -> Result<(Self, ArchiveIdentity), BootstrapError> {
+        Self::bootstrap_with_recovery(config, false).await
+    }
+
+    async fn bootstrap_with_recovery(
+        config: &Config,
+        recover_uploads: bool,
+    ) -> Result<(Self, ArchiveIdentity), BootstrapError> {
         config.validate().map_err(BootstrapError::Configuration)?;
         let storage = StorageLayout::create(&config.data_dir).await?;
         let (database, identity) = database::connect(config).await?;
@@ -360,6 +388,7 @@ impl Service {
             database,
             storage,
             identity: identity.clone(),
+            max_request_body_bytes: config.max_request_body_bytes,
             chunk_size_bytes,
             max_artifact_stored_bytes: config.max_artifact_stored_bytes,
             max_artifact_original_bytes: config.max_artifact_original_bytes,
@@ -369,6 +398,8 @@ impl Service {
             upload_expiry: config.upload_expiry,
             admin_deletion_enabled: config.admin_deletion_enabled,
             blob_gc_grace: config.blob_gc_grace,
+            integrity_scan_concurrency: config.integrity_scan_concurrency,
+            integrity_scan_buffer_bytes: config.integrity_scan_buffer_bytes,
             download_permits: Arc::new(Semaphore::new(config.max_download_concurrency)),
             download_timeout: config.request_timeout,
             upload_locks: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
@@ -378,12 +409,14 @@ impl Service {
             test_hooks: TestHooks::default(),
         });
 
-        ingestion::recover_uploads(&state)
-            .await
-            .map_err(|_| BootstrapError::Recovery)?;
-        ingestion::expire_uploads_at(&state, time::OffsetDateTime::now_utc())
-            .await
-            .map_err(|_| BootstrapError::Recovery)?;
+        if recover_uploads {
+            ingestion::recover_uploads(&state)
+                .await
+                .map_err(|_| BootstrapError::Recovery)?;
+            ingestion::expire_uploads_at(&state, time::OffsetDateTime::now_utc())
+                .await
+                .map_err(|_| BootstrapError::Recovery)?;
+        }
 
         Ok((Self { state }, identity))
     }
@@ -522,6 +555,82 @@ impl Service {
         &self,
     ) -> Result<crate::contract::BlobGcResponse, MaintenanceError> {
         deletion::collect_orphaned_blobs_at(&self.state, time::OffsetDateTime::now_utc()).await
+    }
+
+    /// Observes complete archive integrity and persists immutable findings.
+    ///
+    /// The scan never changes snapshot completion evidence, receipts, or
+    /// blob-candidate state. It can run offline through the maintenance CLI
+    /// or while this service is serving requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when scanner metadata, storage inventory, or durable
+    /// finding persistence cannot safely complete.
+    pub async fn verify_integrity(
+        &self,
+    ) -> Result<crate::contract::IntegrityReport, IntegrityScanError> {
+        integrity::scan_archive(&self.state).await
+    }
+
+    /// Alias for callers that name the operation after its implementation
+    /// rather than its maintenance command.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any integrity scanner failure from [`Self::verify_integrity`].
+    pub async fn scan_integrity(
+        &self,
+    ) -> Result<crate::contract::IntegrityReport, IntegrityScanError> {
+        self.verify_integrity().await
+    }
+
+    /// Compatibility-friendly spelling for maintenance callers.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any integrity scanner failure from [`Self::verify_integrity`].
+    pub async fn verify_archive(
+        &self,
+    ) -> Result<crate::contract::IntegrityReport, IntegrityScanError> {
+        self.verify_integrity().await
+    }
+
+    /// Returns current archive health from the latest completed integrity
+    /// observation, without mutating historical snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when integrity history cannot be read safely.
+    pub async fn latest_integrity_health(
+        &self,
+    ) -> Result<Option<crate::contract::IntegrityRunSummary>, IntegrityScanError> {
+        integrity::latest_health(&self.state).await
+    }
+
+    /// Returns bounded immutable integrity-run history, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when integrity history cannot be read safely.
+    pub async fn list_integrity_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::contract::IntegrityRunSummary>, IntegrityScanError> {
+        integrity::list_runs(&self.state, limit).await
+    }
+
+    /// Returns bounded finding history for one immutable run, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when integrity history cannot be read safely.
+    pub async fn list_integrity_findings(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::contract::IntegrityFindingSummary>, IntegrityScanError> {
+        integrity::list_findings(&self.state, run_id, limit).await
     }
 
     #[cfg(test)]

@@ -19,10 +19,10 @@ use crate::{
     config::Config,
     contract::{
         Artifact, ArtifactMetadataResponse, BlobGcResponse, CanonicalManifestResponse,
-        CanonicalManifestSummary, CaptureProvenance, CompletionResponse, Compression, Manifest,
-        ManifestInput, PaginatedResponse, Receipt, SessionInput, SessionResponse,
-        SnapshotCapturesResponse, SnapshotResponse, SnapshotSummary, TombstoneResponse,
-        UploadResponse, UploadStatus, UploadStatusResponse,
+        CanonicalManifestSummary, CaptureProvenance, CompletionResponse, Compression,
+        IntegrityFindingKind, IntegrityRunStatus, Manifest, ManifestInput, PaginatedResponse,
+        Receipt, SessionInput, SessionResponse, SnapshotCapturesResponse, SnapshotResponse,
+        SnapshotSummary, TombstoneResponse, UploadResponse, UploadStatus, UploadStatusResponse,
     },
 };
 
@@ -5225,4 +5225,480 @@ async fn completion_deletion_and_gc_race_preserves_live_rearchive_blob() {
         fetch_content(&service, &config, &live.artifacts[0].content_url).await;
     assert_eq!(content_status, StatusCode::OK);
     assert_eq!(content, bytes);
+}
+
+#[tokio::test]
+async fn integrity_scan_retains_history_without_rewriting_snapshot_completion() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"integrity history";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "integrity-history",
+        manifest(bytes, bytes, Compression::Identity),
+        bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let before: (String,) = sqlx::query_as("SELECT completed_at FROM snapshots WHERE id = ?1")
+        .bind(&completion.receipt.snapshot_id)
+        .fetch_one(&service.state.database)
+        .await
+        .expect("snapshot completion exists");
+
+    let first = service
+        .verify_integrity()
+        .await
+        .expect("healthy archive scans");
+    assert_eq!(first.status, IntegrityRunStatus::Healthy);
+    assert!(first.findings.is_empty());
+    assert_eq!(
+        service
+            .latest_integrity_health()
+            .await
+            .expect("latest health reads")
+            .expect("first run exists")
+            .run_id,
+        first.run_id
+    );
+    drop(service);
+
+    let (restarted, _) = Service::bootstrap(&config).await.expect("restarts");
+    let historical = restarted
+        .list_integrity_runs(16)
+        .await
+        .expect("history reads after restart");
+    assert_eq!(historical.len(), 1);
+    assert_eq!(historical[0].run_id, first.run_id);
+    let second = restarted
+        .verify_integrity()
+        .await
+        .expect("repeat scan succeeds");
+    assert_ne!(second.run_id, first.run_id);
+    assert_eq!(
+        restarted
+            .list_integrity_runs(16)
+            .await
+            .expect("history remains readable")
+            .len(),
+        2
+    );
+    let after: (String,) = sqlx::query_as("SELECT completed_at FROM snapshots WHERE id = ?1")
+        .bind(&completion.receipt.snapshot_id)
+        .fetch_one(&restarted.state.database)
+        .await
+        .expect("snapshot remains");
+    assert_eq!(
+        after, before,
+        "verification never rewrites completion evidence"
+    );
+    let replayed =
+        complete_upload_for_completion(&restarted, &config, &upload.completion_url).await;
+    assert_eq!(
+        serde_json::to_value(replayed.receipt).expect("receipt serializes"),
+        serde_json::to_value(completion.receipt).expect("receipt serializes"),
+        "verification never rewrites receipt evidence"
+    );
+}
+
+#[tokio::test]
+async fn integrity_scan_reports_blob_failures_and_unexpected_files() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"scan physical blob";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "integrity-physical",
+        manifest(bytes, bytes, Compression::Identity),
+        bytes,
+    )
+    .await;
+    complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let blob_path = service.state.storage.blob_path(&digest_storage_hex(bytes));
+
+    stdfs::write(&blob_path, vec![b'x'; bytes.len()]).expect("test can corrupt blob");
+    let corrupt = service.verify_integrity().await.expect("scan completes");
+    assert_eq!(corrupt.status, IntegrityRunStatus::ActionRequired);
+    assert!(
+        corrupt
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobFileHashMismatch)
+    );
+
+    stdfs::write(&blob_path, b"x").expect("test can truncate blob");
+    let truncated = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        truncated
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobFileSizeMismatch)
+    );
+
+    stdfs::remove_file(&blob_path).expect("test can replace blob with directory");
+    stdfs::create_dir(&blob_path).expect("test can create nonregular blob");
+    let nonregular = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        nonregular
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobFileNonRegular)
+    );
+
+    stdfs::remove_dir(&blob_path).expect("test can remove nonregular blob");
+    let missing = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        missing
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobFileMissing)
+    );
+
+    let unexpected_digest = "aa".to_owned() + &"b".repeat(62);
+    let unexpected_path = service.state.storage.blob_path(&unexpected_digest);
+    stdfs::create_dir_all(
+        unexpected_path
+            .parent()
+            .expect("canonical blob path has a parent"),
+    )
+    .expect("test can create unexpected shard");
+    stdfs::write(&unexpected_path, b"unexpected").expect("test can create unexpected blob");
+    let unexpected = service.verify_integrity().await.expect("scan completes");
+    assert!(unexpected.findings.iter().any(|finding| {
+        finding.kind == IntegrityFindingKind::UnexpectedBlobFile
+            && finding.detail_code == "canonical_blob_file_has_no_blob_row"
+    }));
+}
+
+#[tokio::test]
+async fn integrity_scan_detects_original_mismatch_when_stored_representation_is_valid() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let original = b"original decompressed content";
+    let stored = zstd::stream::encode_all(&original[..], 1).expect("compresses");
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "integrity-original",
+        manifest(original, &stored, Compression::Zstd),
+        &stored,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+
+    let corrupt_original = b"different decompressed content";
+    let corrupt_stored = zstd::stream::encode_all(&corrupt_original[..], 1).expect("compresses");
+    let old_digest = digest_storage_hex(&stored);
+    let new_digest = digest_storage_hex(&corrupt_stored);
+    let old_path = service.state.storage.blob_path(&old_digest);
+    let new_path = service.state.storage.blob_path(&new_digest);
+    stdfs::create_dir_all(new_path.parent().expect("canonical blob has parent"))
+        .expect("test can create destination shard");
+    stdfs::write(&new_path, &corrupt_stored).expect("test can write altered representation");
+    stdfs::remove_file(&old_path).expect("test can replace canonical representation");
+
+    let (manifest_id, canonical_json): (String, String) = sqlx::query_as(
+        "SELECT m.id, m.canonical_json
+         FROM snapshots s JOIN manifests m ON m.id = s.manifest_id
+         WHERE s.id = ?1",
+    )
+    .bind(&completion.receipt.snapshot_id)
+    .fetch_one(&service.state.database)
+    .await
+    .expect("canonical manifest exists");
+    let mut document: serde_json::Value =
+        serde_json::from_str(&canonical_json).expect("canonical manifest parses");
+    document["artifacts"][0]["stored_size_bytes"] = serde_json::json!(corrupt_stored.len());
+    document["artifacts"][0]["stored_sha256"] = serde_json::json!(digest(&corrupt_stored));
+    let canonical_json = serde_json::to_string(&document).expect("canonical manifest serializes");
+    sqlx::query("UPDATE manifests SET canonical_json = ?1, sha256 = ?2 WHERE id = ?3")
+        .bind(&canonical_json)
+        .bind(digest_storage_hex(canonical_json.as_bytes()))
+        .bind(&manifest_id)
+        .execute(&service.state.database)
+        .await
+        .expect("test can update canonical representation metadata");
+    sqlx::query(
+        "UPDATE blobs SET stored_sha256 = ?1, stored_size_bytes = ?2
+         WHERE stored_sha256 = ?3",
+    )
+    .bind(&new_digest)
+    .bind(i64::try_from(corrupt_stored.len()).expect("test size fits"))
+    .bind(&old_digest)
+    .execute(&service.state.database)
+    .await
+    .expect("test can update blob metadata");
+    sqlx::query("UPDATE snapshots SET total_stored_size_bytes = ?1 WHERE id = ?2")
+        .bind(i64::try_from(corrupt_stored.len()).expect("test size fits"))
+        .bind(&completion.receipt.snapshot_id)
+        .execute(&service.state.database)
+        .await
+        .expect("test can update aggregate projection");
+
+    let report = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::ArtifactOriginalMismatch)
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobFileHashMismatch),
+        "the altered stored representation remains internally checksum-valid"
+    );
+}
+
+#[tokio::test]
+async fn integrity_scan_reports_manifest_and_projection_drift() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"projection drift";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "integrity-projection",
+        manifest(bytes, bytes, Compression::Identity),
+        bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+
+    sqlx::query("UPDATE snapshots SET artifact_count = 2 WHERE id = ?1")
+        .bind(&completion.receipt.snapshot_id)
+        .execute(&service.state.database)
+        .await
+        .expect("test can introduce aggregate drift");
+    let projection = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        projection
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::SnapshotProjectionDrift)
+    );
+
+    sqlx::query(
+        "UPDATE manifests SET sha256 = ?1
+         WHERE id = (SELECT manifest_id FROM snapshots WHERE id = ?2)",
+    )
+    .bind("0".repeat(64))
+    .bind(&completion.receipt.snapshot_id)
+    .execute(&service.state.database)
+    .await
+    .expect("test can introduce manifest hash drift");
+    let hash = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        hash.findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::ManifestHashMismatch)
+    );
+
+    sqlx::query(
+        "UPDATE manifests SET canonical_json = '{'
+         WHERE id = (SELECT manifest_id FROM snapshots WHERE id = ?1)",
+    )
+    .bind(&completion.receipt.snapshot_id)
+    .execute(&service.state.database)
+    .await
+    .expect("test can corrupt canonical manifest");
+    let unparseable = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        unparseable
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::ManifestUnparseable)
+    );
+}
+
+#[tokio::test]
+async fn integrity_scan_handles_multi_blob_archives_with_bounded_workers() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.integrity_scan_concurrency = 1;
+    config.integrity_scan_buffer_bytes = 4096;
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let first = vec![b'a'; 2_050];
+    let second = vec![b'b'; 3_075];
+    let upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "integrity-multi",
+        multi_manifest(
+            vec![
+                ("first.bin", &first, &first, Compression::Identity),
+                ("second.bin", &second, &second, Compression::Identity),
+            ],
+            "integrity-multi",
+        ),
+    )
+    .await;
+    for (artifact_index, bytes) in [(0_u32, first.as_slice()), (1_u32, second.as_slice())] {
+        for (chunk_index, chunk) in bytes.chunks(config.chunk_size_bytes).enumerate() {
+            assert_eq!(
+                upload_artifact_chunk(
+                    &service,
+                    &config,
+                    &upload.upload_id,
+                    artifact_index,
+                    u64::try_from(chunk_index).expect("chunk index fits"),
+                    chunk,
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+    complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+
+    let report = service.verify_integrity().await.expect("scan completes");
+    assert_eq!(report.status, IntegrityRunStatus::Healthy);
+    assert_eq!(report.counts.total, 0);
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn integrity_scan_distinguishes_tombstones_and_blob_candidate_states() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.admin_deletion_enabled = true;
+    config.blob_gc_grace = Duration::from_mins(1);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"candidate state";
+    let document = manifest(bytes, bytes, Compression::Identity);
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "integrity-candidate-first",
+        document.clone(),
+        bytes,
+    )
+    .await;
+    let first = complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let blob_digest = digest_storage_hex(bytes);
+    let (deleted, _) = delete_snapshot(
+        &service,
+        &config,
+        &first.receipt.snapshot_id,
+        &first.receipt.snapshot_fingerprint,
+        None,
+    )
+    .await;
+    assert_eq!(deleted, StatusCode::OK);
+
+    let within_grace = service.verify_integrity().await.expect("scan completes");
+    assert_eq!(within_grace.status, IntegrityRunStatus::Healthy);
+    assert!(
+        within_grace
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::TombstonedSnapshot)
+    );
+    assert!(
+        within_grace
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobGraceCandidate)
+    );
+
+    sqlx::query(
+        "UPDATE blobs
+         SET eligible_after = '2000-01-01T00:00:00Z', eligible_after_seq = 0
+         WHERE stored_sha256 = ?1",
+    )
+    .bind(&blob_digest)
+    .execute(&service.state.database)
+    .await
+    .expect("test can make candidate eligible");
+    let eligible = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        eligible
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobGcEligibleCandidate)
+    );
+
+    let rearchive_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "integrity-candidate-rearchive",
+        document,
+        bytes,
+    )
+    .await;
+    let rearchive =
+        complete_upload_for_completion(&service, &config, &rearchive_upload.completion_url).await;
+    sqlx::query(
+        "UPDATE blobs
+         SET orphaned_at = '2000-01-01T00:00:00Z',
+             eligible_after = '2000-01-01T00:00:00Z',
+             eligible_after_seq = 0
+         WHERE stored_sha256 = ?1",
+    )
+    .bind(&blob_digest)
+    .execute(&service.state.database)
+    .await
+    .expect("test can establish stale candidate");
+    let stale = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        stale
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobStaleCandidate)
+    );
+
+    let (deleted, _) = delete_snapshot(
+        &service,
+        &config,
+        &rearchive.receipt.snapshot_id,
+        &rearchive.receipt.snapshot_fingerprint,
+        None,
+    )
+    .await;
+    assert_eq!(deleted, StatusCode::OK);
+    sqlx::query(
+        "UPDATE blobs
+         SET orphaned_at = NULL, eligible_after = NULL, eligible_after_seq = NULL
+         WHERE stored_sha256 = ?1",
+    )
+    .bind(&blob_digest)
+    .execute(&service.state.database)
+    .await
+    .expect("test can establish accidental orphan");
+    let orphan = service.verify_integrity().await.expect("scan completes");
+    assert!(
+        orphan
+            .findings
+            .iter()
+            .any(|finding| finding.kind == IntegrityFindingKind::BlobOrphan)
+    );
 }

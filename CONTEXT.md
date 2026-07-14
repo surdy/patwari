@@ -77,7 +77,14 @@ whose live relationship rows remain authoritative. Re-archiving the same state c
 linked to the Tombstone rather than silently reviving the deleted ID.
 _Avoid_: Soft delete, archived snapshot
 
+**Integrity run**:
+One immutable server-time maintenance observation of archive health. It records bounded aggregate
+counts and owns its time-stamped findings; it does not alter Snapshot completion or receipts.
+_Avoid_: Repair job, snapshot verification status
+
 **Integrity finding**:
 A time-stamped observation of a snapshot or blob's current health. It does not rewrite the historical
-fact that a snapshot passed verification when it was completed.
+fact that a snapshot passed verification when it was completed. Findings belong to an immutable
+integrity scan run and current health is projected from the latest completed run; earlier findings
+remain history.
 _Avoid_: Snapshot status, upload failure

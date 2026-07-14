@@ -524,6 +524,203 @@ pub struct BlobGcResponse {
     pub deleted_blobs: u32,
 }
 
+/// The final outcome of one immutable integrity observation run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityRunStatus {
+    Running,
+    Healthy,
+    ActionRequired,
+    Failed,
+}
+
+impl IntegrityRunStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Healthy => "healthy",
+            Self::ActionRequired => "action_required",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "healthy" => Some(Self::Healthy),
+            "action_required" => Some(Self::ActionRequired),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// A stable severity used to determine whether an operator must act.
+///
+/// `info` documents intentional archive states. `warning` and `error` are
+/// actionable and therefore make an integrity run `action_required`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegritySeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl IntegritySeverity {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "info" => Some(Self::Info),
+            "warning" => Some(Self::Warning),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// Stable categories emitted by the archive integrity scanner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrityFindingKind {
+    ManifestMissing,
+    ManifestUnparseable,
+    ManifestHashMismatch,
+    SnapshotProjectionDrift,
+    DatabaseIntegrityFailure,
+    ArtifactBlobReferenceMissing,
+    BlobMetadataInvalid,
+    BlobFileMissing,
+    BlobFileNonRegular,
+    BlobFileSizeMismatch,
+    BlobFileHashMismatch,
+    ArtifactOriginalMismatch,
+    UnexpectedBlobFile,
+    BlobOrphan,
+    BlobGraceCandidate,
+    BlobGcEligibleCandidate,
+    BlobStaleCandidate,
+    TombstonedSnapshot,
+    TransientChange,
+}
+
+impl IntegrityFindingKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ManifestMissing => "manifest_missing",
+            Self::ManifestUnparseable => "manifest_unparseable",
+            Self::ManifestHashMismatch => "manifest_hash_mismatch",
+            Self::SnapshotProjectionDrift => "snapshot_projection_drift",
+            Self::DatabaseIntegrityFailure => "database_integrity_failure",
+            Self::ArtifactBlobReferenceMissing => "artifact_blob_reference_missing",
+            Self::BlobMetadataInvalid => "blob_metadata_invalid",
+            Self::BlobFileMissing => "blob_file_missing",
+            Self::BlobFileNonRegular => "blob_file_non_regular",
+            Self::BlobFileSizeMismatch => "blob_file_size_mismatch",
+            Self::BlobFileHashMismatch => "blob_file_hash_mismatch",
+            Self::ArtifactOriginalMismatch => "artifact_original_mismatch",
+            Self::UnexpectedBlobFile => "unexpected_blob_file",
+            Self::BlobOrphan => "blob_orphan",
+            Self::BlobGraceCandidate => "blob_grace_candidate",
+            Self::BlobGcEligibleCandidate => "blob_gc_eligible_candidate",
+            Self::BlobStaleCandidate => "blob_stale_candidate",
+            Self::TombstonedSnapshot => "tombstoned_snapshot",
+            Self::TransientChange => "transient_change",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "manifest_missing" => Some(Self::ManifestMissing),
+            "manifest_unparseable" => Some(Self::ManifestUnparseable),
+            "manifest_hash_mismatch" => Some(Self::ManifestHashMismatch),
+            "snapshot_projection_drift" => Some(Self::SnapshotProjectionDrift),
+            "database_integrity_failure" => Some(Self::DatabaseIntegrityFailure),
+            "artifact_blob_reference_missing" => Some(Self::ArtifactBlobReferenceMissing),
+            "blob_metadata_invalid" => Some(Self::BlobMetadataInvalid),
+            "blob_file_missing" => Some(Self::BlobFileMissing),
+            "blob_file_non_regular" => Some(Self::BlobFileNonRegular),
+            "blob_file_size_mismatch" => Some(Self::BlobFileSizeMismatch),
+            "blob_file_hash_mismatch" => Some(Self::BlobFileHashMismatch),
+            "artifact_original_mismatch" => Some(Self::ArtifactOriginalMismatch),
+            "unexpected_blob_file" => Some(Self::UnexpectedBlobFile),
+            "blob_orphan" => Some(Self::BlobOrphan),
+            "blob_grace_candidate" => Some(Self::BlobGraceCandidate),
+            "blob_gc_eligible_candidate" => Some(Self::BlobGcEligibleCandidate),
+            "blob_stale_candidate" => Some(Self::BlobStaleCandidate),
+            "tombstoned_snapshot" => Some(Self::TombstonedSnapshot),
+            "transient_change" => Some(Self::TransientChange),
+            _ => None,
+        }
+    }
+}
+
+/// Aggregated counts for a run. `by_kind` is keyed by stable snake-case
+/// finding names, making it convenient for command-line automation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityFindingCounts {
+    pub total: u64,
+    pub info: u64,
+    pub warning: u64,
+    pub error: u64,
+    pub by_kind: BTreeMap<String, u64>,
+}
+
+/// Redacted, machine-safe evidence for one detected condition.
+///
+/// The scanner never persists paths, manifest bodies, artifact bytes, or raw
+/// capture metadata in a finding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityFindingSummary {
+    pub finding_id: String,
+    pub run_id: String,
+    pub kind: IntegrityFindingKind,
+    pub severity: IntegritySeverity,
+    pub snapshot_id: Option<String>,
+    pub artifact_id: Option<String>,
+    pub blob_id: Option<String>,
+    pub detected_at: String,
+    pub detail_code: String,
+}
+
+/// Immutable summary of one integrity scan run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityRunSummary {
+    pub run_id: String,
+    pub owner_namespace: String,
+    pub status: IntegrityRunStatus,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub counts: IntegrityFindingCounts,
+}
+
+/// The machine-readable result returned by a newly completed scan.
+///
+/// Findings are intentionally capped so a very damaged archive cannot make a
+/// maintenance command load all historical evidence into memory. Counts
+/// always cover the full run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityReport {
+    pub run_id: String,
+    pub owner_namespace: String,
+    pub status: IntegrityRunStatus,
+    pub started_at: String,
+    pub completed_at: String,
+    pub counts: IntegrityFindingCounts,
+    pub findings: Vec<IntegrityFindingSummary>,
+    pub findings_truncated: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,

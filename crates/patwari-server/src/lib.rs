@@ -12,6 +12,7 @@ mod deletion;
 mod error;
 mod health;
 mod ingestion;
+mod integrity;
 mod pagination;
 mod retrieval;
 mod service;
@@ -19,7 +20,8 @@ mod storage;
 mod validation;
 
 pub use service::{
-    ArchiveIdentity, BootstrapError, MaintenanceError, ReconciliationError, Service, serve,
+    ArchiveIdentity, BootstrapError, IntegrityScanError, MaintenanceError, ReconciliationError,
+    Service, serve,
 };
 
 #[cfg(test)]

@@ -19,6 +19,10 @@ pub const DEFAULT_ADMIN_DELETION_ENABLED: bool = false;
 /// A deleted snapshot remains recoverable from host backups while its
 /// unreferenced blobs wait for a conservative server-time grace period.
 pub const DEFAULT_BLOB_GC_GRACE: Duration = Duration::from_hours(7 * 24);
+/// Bounded worker count for offline/online integrity hashing and decoding.
+pub const DEFAULT_INTEGRITY_SCAN_CONCURRENCY: usize = 4;
+/// Fixed buffer used by each integrity scan worker.
+pub const DEFAULT_INTEGRITY_SCAN_BUFFER_BYTES: usize = 64 * 1024;
 pub const MAX_CHUNK_COUNT: u64 = 65_536;
 
 const MIN_REQUEST_BODY_BYTES: usize = 1024;
@@ -35,6 +39,9 @@ const MIN_UPLOAD_EXPIRY: Duration = Duration::from_mins(1);
 const MAX_UPLOAD_EXPIRY: Duration = Duration::from_hours(720);
 const MIN_BLOB_GC_GRACE: Duration = Duration::from_mins(1);
 const MAX_BLOB_GC_GRACE: Duration = Duration::from_hours(365 * 24);
+const MAX_INTEGRITY_SCAN_CONCURRENCY: usize = 32;
+const MIN_INTEGRITY_SCAN_BUFFER_BYTES: usize = 4 * 1024;
+const MAX_INTEGRITY_SCAN_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -56,6 +63,11 @@ pub struct Config {
     pub admin_deletion_enabled: bool,
     /// Server-time delay before an unreferenced blob becomes GC eligible.
     pub blob_gc_grace: Duration,
+    /// Maximum concurrent blocking checksum/decompression workers used by a
+    /// maintenance integrity scan.
+    pub integrity_scan_concurrency: usize,
+    /// Per-worker read buffer for integrity hashing and decompression.
+    pub integrity_scan_buffer_bytes: usize,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -94,6 +106,10 @@ pub enum ConfigError {
     InvalidAdminDeletionEnabled,
     #[error("PATWARI_BLOB_GC_GRACE must be a duration between 60s and 365d")]
     InvalidBlobGcGrace,
+    #[error("PATWARI_INTEGRITY_SCAN_CONCURRENCY must be between 1 and 32")]
+    InvalidIntegrityScanConcurrency,
+    #[error("PATWARI_INTEGRITY_SCAN_BUFFER_BYTES must be between 4096 and 1048576 bytes")]
+    InvalidIntegrityScanBuffer,
 }
 
 impl Default for Config {
@@ -116,6 +132,8 @@ impl Default for Config {
             upload_expiry: DEFAULT_UPLOAD_EXPIRY,
             admin_deletion_enabled: DEFAULT_ADMIN_DELETION_ENABLED,
             blob_gc_grace: DEFAULT_BLOB_GC_GRACE,
+            integrity_scan_concurrency: DEFAULT_INTEGRITY_SCAN_CONCURRENCY,
+            integrity_scan_buffer_bytes: DEFAULT_INTEGRITY_SCAN_BUFFER_BYTES,
         }
     }
 }
@@ -134,6 +152,7 @@ impl Config {
         Self::from_values(&values)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_values(values: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let mut config = Self::default();
 
@@ -242,6 +261,21 @@ impl Config {
                 .ok_or(ConfigError::InvalidBlobGcGrace)?;
         }
 
+        if let Some(value) = values.get("PATWARI_INTEGRITY_SCAN_CONCURRENCY") {
+            config.integrity_scan_concurrency =
+                parse_bounded_usize(value, 1, MAX_INTEGRITY_SCAN_CONCURRENCY)
+                    .ok_or(ConfigError::InvalidIntegrityScanConcurrency)?;
+        }
+
+        if let Some(value) = values.get("PATWARI_INTEGRITY_SCAN_BUFFER_BYTES") {
+            config.integrity_scan_buffer_bytes = parse_bounded_usize(
+                value,
+                MIN_INTEGRITY_SCAN_BUFFER_BYTES,
+                MAX_INTEGRITY_SCAN_BUFFER_BYTES,
+            )
+            .ok_or(ConfigError::InvalidIntegrityScanBuffer)?;
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -308,6 +342,14 @@ impl Config {
         }
         if self.blob_gc_grace < MIN_BLOB_GC_GRACE || self.blob_gc_grace > MAX_BLOB_GC_GRACE {
             return Err(ConfigError::InvalidBlobGcGrace);
+        }
+        if !(1..=MAX_INTEGRITY_SCAN_CONCURRENCY).contains(&self.integrity_scan_concurrency) {
+            return Err(ConfigError::InvalidIntegrityScanConcurrency);
+        }
+        if !(MIN_INTEGRITY_SCAN_BUFFER_BYTES..=MAX_INTEGRITY_SCAN_BUFFER_BYTES)
+            .contains(&self.integrity_scan_buffer_bytes)
+        {
+            return Err(ConfigError::InvalidIntegrityScanBuffer);
         }
         Ok(())
     }
@@ -381,6 +423,8 @@ mod tests {
         assert_eq!(config.upload_expiry, Duration::from_hours(24));
         assert!(!config.admin_deletion_enabled);
         assert_eq!(config.blob_gc_grace, Duration::from_hours(7 * 24));
+        assert_eq!(config.integrity_scan_concurrency, 4);
+        assert_eq!(config.integrity_scan_buffer_bytes, 64 * 1024);
     }
 
     #[test]
@@ -401,6 +445,8 @@ mod tests {
             ("PATWARI_UPLOAD_EXPIRY".into(), "2h".into()),
             ("PATWARI_ADMIN_DELETION_ENABLED".into(), "true".into()),
             ("PATWARI_BLOB_GC_GRACE".into(), "2d".into()),
+            ("PATWARI_INTEGRITY_SCAN_CONCURRENCY".into(), "3".into()),
+            ("PATWARI_INTEGRITY_SCAN_BUFFER_BYTES".into(), "8192".into()),
         ]);
         let config = Config::from_values(&values).expect("configuration should parse");
 
@@ -418,6 +464,8 @@ mod tests {
         assert_eq!(config.upload_expiry, Duration::from_hours(2));
         assert!(config.admin_deletion_enabled);
         assert_eq!(config.blob_gc_grace, Duration::from_hours(2 * 24));
+        assert_eq!(config.integrity_scan_concurrency, 3);
+        assert_eq!(config.integrity_scan_buffer_bytes, 8192);
     }
 
     #[test]
@@ -463,5 +511,15 @@ mod tests {
         let error =
             Config::from_values(&values).expect_err("blob deletion grace must have a safe maximum");
         assert_eq!(error, ConfigError::InvalidBlobGcGrace);
+
+        let values = HashMap::from([("PATWARI_INTEGRITY_SCAN_CONCURRENCY".into(), "0".into())]);
+        let error = Config::from_values(&values)
+            .expect_err("zero integrity workers cannot make scan progress");
+        assert_eq!(error, ConfigError::InvalidIntegrityScanConcurrency);
+
+        let values = HashMap::from([("PATWARI_INTEGRITY_SCAN_BUFFER_BYTES".into(), "1023".into())]);
+        let error = Config::from_values(&values)
+            .expect_err("integrity buffer needs a bounded useful minimum");
+        assert_eq!(error, ConfigError::InvalidIntegrityScanBuffer);
     }
 }

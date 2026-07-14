@@ -58,6 +58,8 @@ Configuration is environment-based and bounded by default:
 | `PATWARI_UPLOAD_EXPIRY` | `24h` | Server-time lifetime of an unfinished upload |
 | `PATWARI_ADMIN_DELETION_ENABLED` | `false` | Enables trusted-boundary administrative deletion and GC HTTP endpoints |
 | `PATWARI_BLOB_GC_GRACE` | `7d` | Server-time delay before an unreferenced blob is GC eligible |
+| `PATWARI_INTEGRITY_SCAN_CONCURRENCY` | `4` | Maximum concurrent checksum/decompression workers used by `verify` |
+| `PATWARI_INTEGRITY_SCAN_BUFFER_BYTES` | `65536` | Per-worker scan read/decompression buffer |
 
 The body limit is 1 KiB–64 MiB, request concurrency is 1–256, download concurrency is 1–64,
 timeout is 1s–5m, chunk size is
@@ -67,7 +69,7 @@ Chunk size must fit the request-body limit, and the configured stored-artifact l
 most 65,536 chunks per artifact; a snapshot is additionally capped at 262,144 chunks. Durations
 accept `s`, `m`, `h`, or `d`. The
 service verifies both stored and decompressed sizes while streaming; it never trusts a declared
-checksum or size alone.
+checksum or size alone. Integrity scan concurrency is 1–32 workers and its buffer is 4 KiB–1 MiB.
 
 Administrative deletion is opt-in: `PATWARI_ADMIN_DELETION_ENABLED` accepts only `true` or `false`
 and defaults to `false`. Blob-GC grace is 1m–365d; it defaults to 7d. Operators must enable the
@@ -76,6 +78,48 @@ v1 service.
 
 Normal output is structured JSON and records only operational fields such as HTTP method, status,
 and duration. It does not log request bodies, archived content, credentials, or filesystem paths.
+
+## Integrity verification
+
+Run a complete maintenance scan without starting the HTTP listener:
+
+```sh
+PATWARI_DATA_DIR=/srv/patwari/data cargo run -p patwari-server -- verify
+```
+
+`verify` writes exactly one JSON report to stdout and diagnostic structured logs to stderr. It exits
+`0` when no action is required, `1` for actionable findings, and `2` when configuration, bootstrap,
+or the scanner itself cannot complete safely. The report includes the UUIDv7 run ID, server
+start/end times, final status, counts by severity and stable finding kind, and a bounded list of
+redacted finding summaries. It never includes paths, manifest content, artifact bytes, or raw
+capture metadata.
+
+Every scan creates an immutable `Integrity Run` and append-only `Integrity Findings`. `info`
+findings describe intentional states; `warning` and `error` findings are actionable. Current health
+is the newest completed run, while prior runs and findings remain available through the in-process
+`Service` methods `latest_integrity_health`, `list_integrity_runs`, and
+`list_integrity_findings`. A finding never changes a Snapshot's completed timestamp, receipt, or
+historical verification fact.
+
+The scan validates canonical manifest existence, parsing, and hash; compares every live normalized
+Snapshot projection with its manifest; checks SQLite foreign keys; recomputes canonical blob sizes
+and SHA-256 digests; validates original artifact digests after bounded identity/Zstandard streaming;
+and inventories only `blobs/sha256/<two-hex>/<sha256>`. It does not recurse through symlinks.
+Files under `uploads/` and dot/partial temporary entries are intentionally not treated as canonical
+blob files. A canonical-looking file without a Blob row is actionable.
+
+Scans are observational and may run while the server accepts uploads, deletion, or GC. They page
+metadata, use fixed digest locks shared with promotion and GC, and revalidate observed rows before
+persisting a corruption finding. A detected in-process change is recorded as non-actionable
+`transient_change` rather than false corruption. Offline `verify` is the strongest consistency
+mode because no server-side writer is concurrently active. It also deliberately bypasses normal
+restart cleanup so an unexpected canonical blob remains evidence for the scan rather than being
+removed before it can be reported.
+
+Blob liveness remains authoritative only through live `Artifact -> Blob` references. A Tombstoned
+Snapshot is reported as informational, as is an unreferenced Blob still inside its configured GC
+grace period. A due GC candidate and a candidate that regained a live reference are actionable
+maintenance conditions; an unreferenced Blob with no valid candidate state is an accidental orphan.
 
 Patwari is designed primarily for programmatic use:
 
