@@ -13,8 +13,8 @@ is needed.
 
 The service establishes a durable archive identity and provides the initial single-artifact archival
 path. A Munshi installation registers its client UUID, creates an upload with one canonical manifest,
-streams the declared stored bytes, completes verification, and then fetches the immutable snapshot or
-stored artifact.
+receives a server-assigned chunk size, streams resumable stored-byte chunks, completes verification,
+and then fetches the immutable snapshot or stored artifact.
 
 ```sh
 cargo run -p patwari-server
@@ -47,6 +47,17 @@ Configuration is environment-based and bounded by default:
 | `PATWARI_MAX_REQUEST_BODY_BYTES` | `33554432` | Infrastructure request-body limit |
 | `PATWARI_MAX_CONCURRENCY` | `64` | Maximum concurrent requests |
 | `PATWARI_REQUEST_TIMEOUT` | `30s` | Maximum request duration |
+| `PATWARI_UPLOAD_CHUNK_SIZE_BYTES` | `4194304` | Fixed server-assigned stored-byte chunk size |
+| `PATWARI_MAX_ARTIFACT_STORED_BYTES` | `1073741824` | Maximum declared compressed artifact size |
+| `PATWARI_MAX_ARTIFACT_ORIGINAL_BYTES` | `4294967296` | Maximum declared decompressed artifact size |
+| `PATWARI_UPLOAD_EXPIRY` | `24h` | Server-time lifetime of an unfinished upload |
+
+The body limit is 1 KiB–64 MiB, concurrency is 1–256, timeout is 1s–5m, chunk size is
+1 KiB–32 MiB, each artifact limit is 1 byte–8 GiB, and unfinished-upload expiry is 1m–30d.
+Chunk size must fit the request-body limit, and the configured stored-artifact limit must fit at
+most 65,536 chunks so status bitmaps remain bounded. Durations accept `s`, `m`, `h`, or `d`. The
+service verifies both stored and decompressed sizes while streaming; it never trusts a declared
+checksum or size alone.
 
 Normal output is structured JSON and records only operational fields such as HTTP method, status,
 and duration. It does not log request bodies, archived content, credentials, or filesystem paths.
@@ -125,7 +136,8 @@ extraction system itself.
 
 - Owns remote session and snapshot identity.
 - Validates manifests and upload state.
-- Streams the one declared artifact to temporary storage with bounded resource use.
+- Negotiates fixed chunks and streams the one declared artifact to temporary storage with bounded
+  resource use.
 - Verifies stored and decompressed original sizes and checksums.
 - Atomically promotes verified blobs into immutable storage.
 - Indexes normalized metadata without interpreting transcript contents.
@@ -292,14 +304,28 @@ GET    /healthz
 PUT    /api/v1/clients/{client_id}
 
 POST   /api/v1/uploads
-PUT    /api/v1/uploads/{upload_id}/artifacts/0/chunks/0
+GET    /api/v1/uploads/{upload_id}
+PUT    /api/v1/uploads/{upload_id}/artifacts/0/chunks/{chunk_index}
+POST   /api/v1/uploads/{upload_id}/abandon
 POST   /api/v1/uploads/{upload_id}/complete
 GET    /api/v1/snapshots/{snapshot_id}
 GET    /api/v1/artifacts/{artifact_id}/content
 ```
 
-Deletion is not part of the normal upload flow. It is an explicit administrative operation,
-disabled by default until retention semantics and CLI confirmation are implemented.
+`POST /uploads` and `GET /uploads/{upload_id}` report the assigned `chunk_size_bytes` and, for
+each upload artifact, its `chunk_count`, `accepted_chunk_bitmap`, and missing indexes. Bitmap byte
+zero represents chunk indexes 0–7 with the least-significant bit representing index 0. Each `PUT`
+must include `Content-Type: application/octet-stream`, `X-Patwari-Chunk-Length`, and
+`X-Patwari-Chunk-SHA256` (`sha256:` plus 64 lowercase hex digits). The server derives the only
+valid length for each index, including the final chunk. For practical compatibility, a headerless
+`chunks/0` request is accepted only when the negotiated artifact has exactly one chunk; its
+canonical manifest supplies the equivalent persisted length and checksum contract.
+
+`POST /uploads/{upload_id}/abandon` explicitly discards resumable bytes. The callable server
+maintenance operation expires uploads by server time. Both paths remove temporary files, chunk
+records, and manifests, retaining only redacted audit facts: client/session IDs, declared sizes and
+chunk count, timestamps, terminal reason, and error code. They do not retain request bodies, paths,
+chunk checksums, or artifact content.
 
 ### Idempotency
 
@@ -309,7 +335,9 @@ disabled by default until retention semantics and CLI confirmation are implement
   returns the existing upload; reusing it for a different manifest returns `409 Conflict`.
 - Session creation is atomic with upload creation and is keyed within the owner namespace by
   `source_agent + source_session_id`.
-- The sole artifact is addressed as chunk index `0`; multi-chunk resume is deliberately deferred.
+- The v1 sole artifact is addressed as artifact index `0` and server-negotiated chunk indexes.
+  Retrying a chunk with the same index, length, and checksum is idempotent; a different length or
+  checksum returns `409 Conflict` without replacing accepted bytes.
 - Retrying completion returns byte-for-byte the same versioned receipt, including the persistent
   archive instance ID.
 
@@ -323,7 +351,8 @@ disabled by default until retention semantics and CLI confirmation are implement
 │       └── ab/
 │           └── abcdef...
 ├── uploads/
-│   └── <snapshot-id>/
+│   └── <upload-id>/
+│       └── artifacts/0/chunks/<chunk-index>
 └── maintenance/
 ```
 
@@ -331,7 +360,10 @@ disabled by default until retention semantics and CLI confirmation are implement
 - Completed blobs are content-addressed by the checksum of the stored compressed bytes.
 - Snapshot artifacts reference blobs, allowing safe deduplication.
 - Temporary uploads and completed blobs are on the same filesystem so promotion can use atomic
-  rename.
+  hard links and cleanup can be recovered after a crash.
+- Chunk files are synced and linked before their metadata record is committed. Restart recovery
+  removes file-only remnants and makes metadata-only chunks retryable; completion assembles verified
+  chunks into a bounded streaming file before blob promotion.
 - Database and blob paths live on one dedicated persistent volume.
 - Backup tooling must capture SQLite and blobs consistently. Patwari will provide a maintenance
   command that creates a SQLite online backup and a blob inventory for filesystem-level backup.
@@ -506,7 +538,6 @@ all compressed files byte-for-byte, and safely preview manual removal of the ori
 ## Deferred decisions
 
 - Exact Copilot CLI artifact set and consistency strategy, pending the Phase 0 spike.
-- Chunk size and maximum artifact/snapshot limits, informed by real session measurements.
 - Retention and explicit remote deletion policy.
 - Authentication if Patwari crosses the trusted network boundary.
 - Restore compatibility contracts for each coding agent.
