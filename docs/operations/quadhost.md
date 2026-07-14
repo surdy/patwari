@@ -64,10 +64,13 @@ curl --fail http://192.168.16.169:8787/readyz
 `ReadOnly=true`, a small `/tmp` tmpfs, dropped capabilities,
 `NoNewPrivileges`, a non-root image user, cgroup resource limits, journald
 logging, graceful `SIGTERM`, and a `/readyz` container health check are all
-set in `patwari.container`. The `:Z,U` volume option labels the named volume
-for SELinux and gives its contents to the image UID. Retain it when adapting
-the Quadlet; direct bind mounts need the equivalent SELinux label and must be
-on local durable storage, never NFS or disposable cache.
+set in `patwari.container`. The `:z,U` volume option gives the named volume a
+shared SELinux label and gives its contents to the image UID. The lowercase
+`:z` is required because the running service and maintenance containers mount
+the same volume concurrently; private `:Z` relabeling can revoke the running
+container's access and trigger a health restart. Retain the shared label when
+adapting the Quadlet; direct bind mounts need the equivalent SELinux label and
+must be on local durable storage, never NFS or disposable cache.
 
 The volume is mounted at the writable root `/var/lib/patwari-volume`, not at
 `PATWARI_DATA_DIR` itself; `patwari.env` points `PATWARI_DATA_DIR` at the
@@ -99,7 +102,7 @@ STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 sudo install -d -o 10001 -g 10001 -m 0750 /var/backups/patwari
 sudo podman run --rm --network=none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   --user 10001:10001 \
-  -v systemd-patwari-data:/var/lib/patwari-volume:Z \
+  -v systemd-patwari-data:/var/lib/patwari-volume:z \
   -v /var/backups/patwari:/backups:Z \
   "$IMAGE" backup create --output "/backups/patwari-$STAMP"
 ```
@@ -153,7 +156,7 @@ After=patwari.service
 [Service]
 Type=oneshot
 Environment=IMAGE=registry.example/patwari:git-<commit>@sha256:<digest>
-ExecStart=/bin/sh -c 'set -eu; stamp=$$(date -u +%%Y%%m%%dT%%H%%M%%SZ); exec /usr/bin/podman run --rm --network=none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --user 10001:10001 -v systemd-patwari-data:/var/lib/patwari-volume:Z -v /var/backups/patwari:/backups:Z "$$IMAGE" backup create --output "/backups/patwari-$$stamp"'
+ExecStart=/bin/sh -c 'set -eu; stamp=$$(date -u +%%Y%%m%%dT%%H%%M%%SZ); exec /usr/bin/podman run --rm --network=none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --user 10001:10001 -v systemd-patwari-data:/var/lib/patwari-volume:z -v /var/backups/patwari:/backups:Z "$$IMAGE" backup create --output "/backups/patwari-$$stamp"'
 ```
 
 ```ini
@@ -193,7 +196,7 @@ sudo deploy/quadhost/install.sh --no-start --image "$IMAGE"
 sudo podman volume create systemd-patwari-data
 sudo podman run --rm --network=none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   --user 10001:10001 \
-  -v systemd-patwari-data:/var/lib/patwari-volume:Z,U \
+  -v systemd-patwari-data:/var/lib/patwari-volume:z,U \
   -v /var/backups/patwari:/backups:Z \
   "$IMAGE" backup restore "/backups/patwari-$STAMP" --data-dir /var/lib/patwari-volume/data
 sudo systemctl start patwari.service
@@ -213,7 +216,7 @@ curl --fail http://192.168.16.169:8787/api/v1/sessions
 # Retry a known completed upload's /api/v1/uploads/<id>/complete URL to
 # reproduce its receipt, then GET its artifact content URL and compare bytes.
 sudo podman run --rm --network=none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-  --user 10001:10001 -v systemd-patwari-data:/var/lib/patwari-volume:Z \
+  --user 10001:10001 -v systemd-patwari-data:/var/lib/patwari-volume:z \
   "$IMAGE" verify
 ```
 
