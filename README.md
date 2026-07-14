@@ -8,6 +8,46 @@ Munshi captures session files on developer machines, compresses them, and upload
 snapshots to Patwari. Notesmith remains the home for human-readable summaries. A Notesmith summary
 may reference its Patwari session ID when full context is needed.
 
+## Running the archive foundation
+
+The current service establishes a durable archive identity and proves its local dependencies are
+usable. It deliberately does not yet expose ingestion APIs.
+
+```sh
+cargo run -p patwari-server
+curl -i http://127.0.0.1:8080/healthz
+curl -i http://127.0.0.1:8080/readyz
+```
+
+An empty data directory is initialized transactionally with one `v1` owner namespace, a generated
+archive instance ID, the SQLite schema, and this persistent-volume layout:
+
+```text
+data/
+├── patwari.db
+├── blobs/
+├── uploads/
+└── maintenance/
+```
+
+Restarting with the same `PATWARI_DATA_DIR` retains the owner namespace and archive instance ID.
+`/healthz` is process liveness and stays available when dependencies fail. `/readyz` returns `200`
+only after SQLite accepts a query and every storage directory accepts a write-and-remove probe; it
+returns `503` otherwise.
+
+Configuration is environment-based and bounded by default:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PATWARI_DATA_DIR` | `data` | Dedicated persistent volume directory |
+| `PATWARI_BIND_ADDR` | `127.0.0.1:8080` | Listener; loopback is the safe default |
+| `PATWARI_MAX_REQUEST_BODY_BYTES` | `33554432` | Infrastructure request-body limit |
+| `PATWARI_MAX_CONCURRENCY` | `64` | Maximum concurrent requests |
+| `PATWARI_REQUEST_TIMEOUT` | `30s` | Maximum request duration |
+
+Normal output is structured JSON and records only operational fields such as HTTP method, status,
+and duration. It does not log request bodies, archived content, credentials, or filesystem paths.
+
 Patwari is designed primarily for programmatic use:
 
 - reliable archival of complete session transcripts and related source files;
