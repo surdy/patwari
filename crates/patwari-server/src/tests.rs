@@ -11,7 +11,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::{
-    Service,
+    ReconciliationError, Service,
     config::Config,
     contract::{
         Compression, Receipt, SnapshotResponse, UploadResponse, UploadStatus, UploadStatusResponse,
@@ -117,6 +117,43 @@ fn manifest_with_session(
     })
 }
 
+fn multi_manifest(
+    artifacts: Vec<(&str, &[u8], &[u8], Compression)>,
+    source_session_id: &str,
+) -> serde_json::Value {
+    let artifacts = artifacts
+        .into_iter()
+        .map(|(logical_path, original, stored, compression)| {
+            serde_json::json!({
+                "logical_path": logical_path,
+                "media_type": "application/octet-stream",
+                "original_size_bytes": original.len(),
+                "original_sha256": digest(original),
+                "stored_size_bytes": stored.len(),
+                "stored_sha256": digest(stored),
+                "compression": compression
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema_version": 1,
+        "session": {
+            "source_agent": "copilot-cli",
+            "source_session_id": source_session_id
+        },
+        "capture": {
+            "captured_at": "2026-07-13T20:00:00Z",
+            "source_cursor": "1",
+            "project": "patwari",
+            "repository": "surdy/patwari",
+            "branch": "main",
+            "source_agent_version": "1.0",
+            "munshi_version": "1.0"
+        },
+        "artifacts": artifacts
+    })
+}
+
 async fn register(app: Router, client_id: Uuid) {
     let (status, _, _) = call(
         app,
@@ -162,6 +199,10 @@ fn chunk_url(upload_id: &str, index: u64) -> String {
     format!("/api/v1/uploads/{upload_id}/artifacts/0/chunks/{index}")
 }
 
+fn artifact_chunk_url(upload_id: &str, artifact_index: u32, chunk_index: u64) -> String {
+    format!("/api/v1/uploads/{upload_id}/artifacts/{artifact_index}/chunks/{chunk_index}")
+}
+
 fn chunk_request(url: &str, bytes: &[u8]) -> Request<Body> {
     Request::builder()
         .method("PUT")
@@ -183,6 +224,25 @@ async fn upload_chunk(
     let (status, _, _) = call(
         service.router(config),
         chunk_request(&chunk_url(upload_id, index), bytes),
+    )
+    .await;
+    status
+}
+
+async fn upload_artifact_chunk(
+    service: &Service,
+    config: &Config,
+    upload_id: &str,
+    artifact_index: u32,
+    chunk_index: u64,
+    bytes: &[u8],
+) -> StatusCode {
+    let (status, _, _) = call(
+        service.router(config),
+        chunk_request(
+            &artifact_chunk_url(upload_id, artifact_index, chunk_index),
+            bytes,
+        ),
     )
     .await;
     status
@@ -840,7 +900,10 @@ async fn duplicate_snapshot_with_different_stored_representation_keeps_only_firs
         &config,
         client_id,
         "dedup-zstd",
-        manifest(&original, &zstd_stored, Compression::Zstd),
+        multi_manifest(
+            vec![("events.jsonl", &original, &zstd_stored, Compression::Zstd)],
+            "source-session-1",
+        ),
     )
     .await;
     for (index, bytes) in zstd_stored.chunks(1024).enumerate() {
@@ -1331,6 +1394,63 @@ async fn declared_artifact_limits_are_enforced_before_upload() {
 }
 
 #[tokio::test]
+async fn declared_snapshot_count_and_aggregate_limits_are_enforced_before_upload() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.max_artifact_count = 2;
+    config.max_snapshot_stored_bytes = 1_500;
+    config.max_snapshot_original_bytes = 1_500;
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = vec![b'a'; 1_000];
+    let count_document = multi_manifest(
+        vec![
+            ("count-a.bin", &bytes, &bytes, Compression::Identity),
+            ("count-b.bin", &bytes, &bytes, Compression::Identity),
+            ("count-c.bin", &bytes, &bytes, Compression::Identity),
+        ],
+        "aggregate-limits",
+    );
+    let (count_status, _, _) = call(
+        service.router(&config),
+        json_request(
+            "POST",
+            "/api/v1/uploads",
+            &serde_json::json!({
+                "client_id": client_id.to_string(),
+                "idempotency_key": "count-too-large",
+                "manifest": count_document
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(count_status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let aggregate_document = multi_manifest(
+        vec![
+            ("one.bin", &bytes, &bytes, Compression::Identity),
+            ("two.bin", &bytes, &bytes, Compression::Identity),
+        ],
+        "aggregate-limits",
+    );
+    let (status, _, _) = call(
+        service.router(&config),
+        json_request(
+            "POST",
+            "/api/v1/uploads",
+            &serde_json::json!({
+                "client_id": client_id.to_string(),
+                "idempotency_key": "aggregate-too-large",
+                "manifest": aggregate_document
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn health_remains_live_when_storage_is_not_ready() {
     let data_dir = TestDataDir::new();
     let config = test_config(&data_dir);
@@ -1356,4 +1476,641 @@ async fn health_remains_live_when_storage_is_not_ready() {
     .await;
     assert_eq!(live, StatusCode::OK);
     assert_eq!(ready, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn multi_artifact_upload_canonicalizes_paths_and_verifies_mixed_encodings() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let identity = vec![b'i'; 1_500];
+    let original_zstd = (0_u32..2_700)
+        .map(|value| {
+            let mixed = value.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            mixed.to_le_bytes()[2]
+        })
+        .collect::<Vec<_>>();
+    let zstd = zstd::stream::encode_all(&original_zstd[..], 1).expect("compresses");
+    assert!(zstd.len() > 1_024, "fixture spans more than one zstd chunk");
+    let upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "multi-mixed",
+        multi_manifest(
+            vec![
+                ("z-events.bin", &original_zstd, &zstd, Compression::Zstd),
+                ("a-index.bin", &identity, &identity, Compression::Identity),
+            ],
+            "multi-mixed",
+        ),
+    )
+    .await;
+
+    assert_eq!(upload.artifacts.len(), 2);
+    assert_eq!(upload.artifacts[0].artifact_index, 0);
+    assert_eq!(upload.artifacts[0].logical_path, "a-index.bin");
+    assert_eq!(
+        upload.artifacts[0].original_sha256,
+        digest(&identity),
+        "per-artifact status exposes the declared original identity"
+    );
+    assert_eq!(upload.artifacts[0].compression, Compression::Identity);
+    assert_eq!(upload.artifacts[0].chunk_count, 2);
+    assert_eq!(upload.artifacts[1].artifact_index, 1);
+    assert_eq!(upload.artifacts[1].logical_path, "z-events.bin");
+    assert_eq!(upload.artifacts[1].stored_sha256, digest(&zstd));
+    assert_eq!(upload.artifacts[1].compression, Compression::Zstd);
+    assert!(upload.artifacts[1].chunk_count > 1);
+    assert!(
+        upload.artifacts[1]
+            .chunk_upload_url
+            .contains("/artifacts/1/chunks/{chunk_index}")
+    );
+
+    for (index, bytes) in identity.chunks(1_024).enumerate() {
+        assert_eq!(
+            upload_artifact_chunk(&service, &config, &upload.upload_id, 0, index as u64, bytes)
+                .await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    for (index, bytes) in zstd.chunks(1_024).enumerate() {
+        assert_eq!(
+            upload_artifact_chunk(&service, &config, &upload.upload_id, 1, index as u64, bytes)
+                .await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let receipt = complete_upload_for_receipt(&service, &config, &upload.completion_url).await;
+    assert_eq!(receipt.artifact_count, 2);
+    assert_eq!(
+        receipt.total_original_bytes,
+        (identity.len() + original_zstd.len()) as u64
+    );
+    assert_eq!(
+        receipt.total_stored_bytes,
+        (identity.len() + zstd.len()) as u64
+    );
+    assert_eq!(receipt.upload_transfer_bytes, receipt.total_stored_bytes);
+    assert_eq!(
+        receipt.newly_persisted_physical_bytes,
+        receipt.total_stored_bytes
+    );
+
+    let snapshot = fetch_snapshot(&service, &config, &receipt.snapshot_id).await;
+    assert_eq!(snapshot.artifact_count, 2);
+    assert_eq!(
+        snapshot
+            .manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.logical_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a-index.bin", "z-events.bin"]
+    );
+    assert_eq!(snapshot.artifacts.len(), 2);
+    assert_eq!(snapshot.artifacts[0].artifact_index, 0);
+    assert_eq!(snapshot.artifacts[1].artifact_index, 1);
+}
+
+#[tokio::test]
+async fn incomplete_or_corrupt_member_never_creates_a_partial_snapshot() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let first = vec![b'a'; 1_024];
+    let second = b"second artifact bytes".to_vec();
+    let upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "no-partial-snapshot",
+        multi_manifest(
+            vec![
+                ("first.bin", &first, &first, Compression::Identity),
+                ("second.bin", &second, &second, Compression::Identity),
+            ],
+            "no-partial-snapshot",
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        upload_artifact_chunk(&service, &config, &upload.upload_id, 0, 0, &first).await,
+        StatusCode::NO_CONTENT
+    );
+    let (missing_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .method("POST")
+            .uri(&upload.completion_url)
+            .body(Body::empty())
+            .expect("completion request is valid"),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::CONFLICT);
+    assert_eq!(snapshot_count(&service).await, 0);
+
+    assert_eq!(
+        upload_artifact_chunk(&service, &config, &upload.upload_id, 1, 0, &second).await,
+        StatusCode::NO_CONTENT
+    );
+    let second_chunk = service
+        .state
+        .storage
+        .artifact_chunk_path(&upload.upload_id, 1, 0);
+    stdfs::write(&second_chunk, vec![b'x'; second.len()]).expect("test can corrupt chunk");
+    let (corrupt_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .method("POST")
+            .uri(&upload.completion_url)
+            .body(Body::empty())
+            .expect("completion request is valid"),
+    )
+    .await;
+    assert_eq!(corrupt_status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(snapshot_count(&service).await, 0);
+}
+
+#[tokio::test]
+async fn rejects_duplicate_and_unsafe_multi_artifact_paths_and_object_kinds() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"path fixture";
+
+    let mut duplicate = multi_manifest(
+        vec![
+            ("Alpha.txt", bytes, bytes, Compression::Identity),
+            ("alpha.txt", bytes, bytes, Compression::Identity),
+        ],
+        "unsafe-paths",
+    );
+    let mut file_tree_conflict = multi_manifest(
+        vec![
+            ("node", bytes, bytes, Compression::Identity),
+            ("node/child", bytes, bytes, Compression::Identity),
+        ],
+        "unsafe-paths",
+    );
+    let mut traversal = multi_manifest(
+        vec![("safe.txt", bytes, bytes, Compression::Identity)],
+        "unsafe-paths",
+    );
+    traversal["artifacts"][0]["logical_path"] = serde_json::json!("../escape");
+    let mut drive = multi_manifest(
+        vec![("safe.txt", bytes, bytes, Compression::Identity)],
+        "unsafe-paths",
+    );
+    drive["artifacts"][0]["logical_path"] = serde_json::json!("C:drive.txt");
+    let mut reserved_device = multi_manifest(
+        vec![("safe.txt", bytes, bytes, Compression::Identity)],
+        "unsafe-paths",
+    );
+    reserved_device["artifacts"][0]["logical_path"] = serde_json::json!("CON.txt");
+    let mut symlink_kind = multi_manifest(
+        vec![("safe.txt", bytes, bytes, Compression::Identity)],
+        "unsafe-paths",
+    );
+    symlink_kind["artifacts"][0]["kind"] = serde_json::json!("symlink");
+
+    for (key, document) in [
+        ("duplicate-portable-path", &mut duplicate),
+        ("file-tree-conflict", &mut file_tree_conflict),
+        ("traversal-path", &mut traversal),
+        ("drive-path", &mut drive),
+        ("reserved-device-path", &mut reserved_device),
+        ("symlink-kind", &mut symlink_kind),
+    ] {
+        let (status, _, _) = call(
+            service.router(&config),
+            json_request(
+                "POST",
+                "/api/v1/uploads",
+                &serde_json::json!({
+                    "client_id": client_id.to_string(),
+                    "idempotency_key": key,
+                    "manifest": document
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[tokio::test]
+async fn restart_resumes_each_artifact_independently() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let first = vec![b'a'; 1_500];
+    let second = vec![b'b'; 1_500];
+    let upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "restart-per-artifact",
+        multi_manifest(
+            vec![
+                ("first.bin", &first, &first, Compression::Identity),
+                ("second.bin", &second, &second, Compression::Identity),
+            ],
+            "restart-per-artifact",
+        ),
+    )
+    .await;
+    assert_eq!(
+        upload_artifact_chunk(&service, &config, &upload.upload_id, 0, 0, &first[..1024]).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        upload_artifact_chunk(&service, &config, &upload.upload_id, 1, 0, &second[..1024]).await,
+        StatusCode::NO_CONTENT
+    );
+    drop(service);
+
+    let (restarted, _) = Service::bootstrap(&config).await.expect("restarts");
+    let (status, _, body) = call(
+        restarted.router(&config),
+        Request::builder()
+            .uri(&upload.status_url)
+            .body(Body::empty())
+            .expect("status request is valid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resumed: UploadStatusResponse =
+        serde_json::from_slice(&body).expect("resumed status parses");
+    assert_eq!(resumed.artifacts.len(), 2);
+    assert_eq!(resumed.artifacts[0].accepted_chunk_bitmap, "01");
+    assert_eq!(resumed.artifacts[1].accepted_chunk_bitmap, "01");
+
+    assert_eq!(
+        upload_artifact_chunk(&restarted, &config, &upload.upload_id, 0, 1, &first[1024..]).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        upload_artifact_chunk(
+            &restarted,
+            &config,
+            &upload.upload_id,
+            1,
+            1,
+            &second[1024..]
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let receipt = complete_upload_for_receipt(&restarted, &config, &upload.completion_url).await;
+    assert_eq!(receipt.artifact_count, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_multi_artifact_completion_creates_one_complete_snapshot() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let first = vec![b'a'; 1_100];
+    let second = vec![b'b'; 1_200];
+    let first_manifest = multi_manifest(
+        vec![
+            ("b.bin", &second, &second, Compression::Identity),
+            ("a.bin", &first, &first, Compression::Identity),
+        ],
+        "concurrent-multi",
+    );
+    let second_manifest = multi_manifest(
+        vec![
+            ("a.bin", &first, &first, Compression::Identity),
+            ("b.bin", &second, &second, Compression::Identity),
+        ],
+        "concurrent-multi",
+    );
+    let first_upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "concurrent-multi-a",
+        first_manifest,
+    )
+    .await;
+    let second_upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "concurrent-multi-b",
+        second_manifest,
+    )
+    .await;
+
+    for upload in [&first_upload, &second_upload] {
+        for (artifact_index, bytes) in [(0_u32, &first), (1_u32, &second)] {
+            for (chunk_index, chunk) in bytes.chunks(1024).enumerate() {
+                assert_eq!(
+                    upload_artifact_chunk(
+                        &service,
+                        &config,
+                        &upload.upload_id,
+                        artifact_index,
+                        chunk_index as u64,
+                        chunk
+                    )
+                    .await,
+                    StatusCode::NO_CONTENT
+                );
+            }
+        }
+    }
+
+    let first_app = service.router(&config);
+    let first_url = first_upload.completion_url.clone();
+    let first_task = tokio::spawn(async move {
+        call(
+            first_app,
+            Request::builder()
+                .method("POST")
+                .uri(first_url)
+                .body(Body::empty())
+                .expect("completion request is valid"),
+        )
+        .await
+    });
+    let second_app = service.router(&config);
+    let second_url = second_upload.completion_url.clone();
+    let second_task = tokio::spawn(async move {
+        call(
+            second_app,
+            Request::builder()
+                .method("POST")
+                .uri(second_url)
+                .body(Body::empty())
+                .expect("completion request is valid"),
+        )
+        .await
+    });
+    let (first_status, _, first_body) = first_task.await.expect("first task completes");
+    let (second_status, _, second_body) = second_task.await.expect("second task completes");
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    let first_receipt: Receipt = serde_json::from_slice(&first_body).expect("receipt parses");
+    let second_receipt: Receipt = serde_json::from_slice(&second_body).expect("receipt parses");
+    assert_eq!(first_receipt.snapshot_id, second_receipt.snapshot_id);
+    assert_eq!(snapshot_count(&service).await, 1);
+    let snapshot = fetch_snapshot(&service, &config, &first_receipt.snapshot_id).await;
+    assert_eq!(snapshot.artifacts.len(), 2);
+    assert_eq!(
+        first_receipt.newly_persisted_physical_bytes
+            + second_receipt.newly_persisted_physical_bytes,
+        (first.len() + second.len()) as u64
+    );
+}
+
+#[tokio::test]
+async fn shared_blobs_and_alternate_representations_report_distinct_metrics() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let original = b"shared original artifact\n".repeat(300);
+    let first_upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "shared-identity",
+        multi_manifest(
+            vec![
+                ("a.txt", &original, &original, Compression::Identity),
+                ("b.txt", &original, &original, Compression::Identity),
+            ],
+            "shared-and-dedup",
+        ),
+    )
+    .await;
+    for artifact_index in 0..2 {
+        for (chunk_index, bytes) in original.chunks(1024).enumerate() {
+            assert_eq!(
+                upload_artifact_chunk(
+                    &service,
+                    &config,
+                    &first_upload.upload_id,
+                    artifact_index,
+                    chunk_index as u64,
+                    bytes
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+    let first_receipt =
+        complete_upload_for_receipt(&service, &config, &first_upload.completion_url).await;
+    assert_eq!(first_receipt.artifact_count, 2);
+    assert_eq!(
+        first_receipt.total_stored_bytes,
+        (original.len() * 2) as u64
+    );
+    assert_eq!(
+        first_receipt.upload_transfer_bytes,
+        (original.len() * 2) as u64
+    );
+    assert_eq!(
+        first_receipt.newly_persisted_physical_bytes,
+        original.len() as u64
+    );
+    let blob_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
+        .fetch_one(&service.state.database)
+        .await
+        .expect("blob query succeeds");
+    assert_eq!(blob_count.0, 1);
+
+    let zstd = zstd::stream::encode_all(&original[..], 1).expect("compresses");
+    let alternate_upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "shared-zstd",
+        multi_manifest(
+            vec![
+                ("a.txt", &original, &zstd, Compression::Zstd),
+                ("b.txt", &original, &zstd, Compression::Zstd),
+            ],
+            "shared-and-dedup",
+        ),
+    )
+    .await;
+    for artifact_index in 0..2 {
+        for (chunk_index, bytes) in zstd.chunks(1024).enumerate() {
+            assert_eq!(
+                upload_artifact_chunk(
+                    &service,
+                    &config,
+                    &alternate_upload.upload_id,
+                    artifact_index,
+                    chunk_index as u64,
+                    bytes
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+    let alternate_receipt =
+        complete_upload_for_receipt(&service, &config, &alternate_upload.completion_url).await;
+    assert_eq!(alternate_receipt.snapshot_id, first_receipt.snapshot_id);
+    assert_eq!(
+        alternate_receipt.upload_transfer_bytes,
+        (zstd.len() * 2) as u64
+    );
+    assert_eq!(alternate_receipt.newly_persisted_physical_bytes, 0);
+    let blobs_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
+        .fetch_one(&service.state.database)
+        .await
+        .expect("blob query succeeds");
+    assert_eq!(blobs_after.0, 1);
+}
+
+#[tokio::test]
+async fn reconciliation_accepts_canonical_rows_and_detects_induced_drift() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let first = b"first";
+    let second = b"second";
+    let upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "reconcile",
+        multi_manifest(
+            vec![
+                ("first.txt", first, first, Compression::Identity),
+                ("second.txt", second, second, Compression::Identity),
+            ],
+            "reconcile",
+        ),
+    )
+    .await;
+    assert_eq!(
+        upload_artifact_chunk(&service, &config, &upload.upload_id, 0, 0, first).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        upload_artifact_chunk(&service, &config, &upload.upload_id, 1, 0, second).await,
+        StatusCode::NO_CONTENT
+    );
+    let receipt = complete_upload_for_receipt(&service, &config, &upload.completion_url).await;
+    assert!(
+        service
+            .reconcile_snapshot(&receipt.snapshot_id)
+            .await
+            .is_ok()
+    );
+    sqlx::query(
+        "UPDATE artifacts SET logical_path = 'drift.txt'
+         WHERE snapshot_id = ?1 AND artifact_index = 0",
+    )
+    .bind(&receipt.snapshot_id)
+    .execute(&service.state.database)
+    .await
+    .expect("induce normalized-row drift");
+    assert!(matches!(
+        service.reconcile_snapshot(&receipt.snapshot_id).await,
+        Err(ReconciliationError::Drift)
+    ));
+}
+
+#[tokio::test]
+async fn legacy_singleton_manifest_rows_remain_readable_but_new_rows_are_canonical_arrays() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"legacy manifest compatibility";
+    let upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "legacy-manifest-row",
+        manifest(bytes, bytes, Compression::Identity),
+    )
+    .await;
+    let canonical_json: (String,) =
+        sqlx::query_as("SELECT canonical_json FROM manifests WHERE upload_id = ?1")
+            .bind(&upload.upload_id)
+            .fetch_one(&service.state.database)
+            .await
+            .expect("canonical manifest query succeeds");
+    let canonical: serde_json::Value =
+        serde_json::from_str(&canonical_json.0).expect("canonical manifest parses");
+    assert!(canonical.get("artifacts").is_some());
+    assert!(canonical.get("artifact").is_none());
+
+    assert_eq!(
+        upload_artifact_chunk(&service, &config, &upload.upload_id, 0, 0, bytes).await,
+        StatusCode::NO_CONTENT
+    );
+    let receipt = complete_upload_for_receipt(&service, &config, &upload.completion_url).await;
+
+    // Simulate the raw singleton JSON and digest retained by a pre-issue-4
+    // completed database. It must deserialize and reconcile without turning
+    // its normalized artifact projection into an unreadable snapshot.
+    let historical_json =
+        serde_json::to_string(&manifest(bytes, bytes, Compression::Identity)).expect("serializes");
+    let historical_hash = digest(historical_json.as_bytes())
+        .strip_prefix("sha256:")
+        .expect("digest has prefix")
+        .to_owned();
+    sqlx::query(
+        "UPDATE manifests SET canonical_json = ?1, sha256 = ?2
+         WHERE id = (SELECT manifest_id FROM snapshots WHERE id = ?3)",
+    )
+    .bind(historical_json)
+    .bind(historical_hash)
+    .bind(&receipt.snapshot_id)
+    .execute(&service.state.database)
+    .await
+    .expect("simulate historical manifest row");
+    sqlx::query("DELETE FROM upload_artifacts WHERE upload_id = ?1")
+        .bind(&upload.upload_id)
+        .execute(&service.state.database)
+        .await
+        .expect("simulate a pre-multi-artifact upload projection");
+    drop(service);
+
+    let (restarted, _) = Service::bootstrap(&config)
+        .await
+        .expect("migrates legacy projection");
+    let projected: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM upload_artifacts WHERE upload_id = ?1")
+            .bind(&upload.upload_id)
+            .fetch_one(&restarted.state.database)
+            .await
+            .expect("projection query succeeds");
+    assert_eq!(projected.0, 1);
+    let snapshot = fetch_snapshot(&restarted, &config, &receipt.snapshot_id).await;
+    assert_eq!(snapshot.manifest.artifacts.len(), 1);
+    assert!(
+        restarted
+            .reconcile_snapshot(&receipt.snapshot_id)
+            .await
+            .is_ok()
+    );
 }

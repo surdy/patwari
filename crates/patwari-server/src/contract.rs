@@ -31,10 +31,7 @@ pub struct CreateUploadRequest {
     pub manifest: ManifestInput,
 }
 
-/// The initial upload negotiation response.
-///
-/// Version 1 has one artifact, but exposes it as an array so a later
-/// multi-artifact manifest can retain this status shape.
+/// The upload negotiation response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UploadResponse {
     pub upload_id: String,
@@ -43,7 +40,10 @@ pub struct UploadResponse {
     pub manifest_sha256: String,
     pub chunk_size_bytes: u64,
     pub artifacts: Vec<UploadArtifactStatus>,
-    /// Compatibility shortcut for the first chunk of the sole v1 artifact.
+    /// Compatibility shortcut for the first chunk of artifact zero.
+    ///
+    /// Clients uploading more than one artifact must use the per-artifact
+    /// `chunk_upload_url` in `artifacts`.
     pub artifact_upload_url: String,
     pub status_url: String,
     pub abandon_url: String,
@@ -67,8 +67,16 @@ pub struct UploadStatusResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UploadArtifactStatus {
     pub artifact_index: u32,
+    pub logical_path: String,
+    pub media_type: Option<String>,
+    pub original_size_bytes: u64,
+    pub original_sha256: String,
     pub stored_size_bytes: u64,
+    pub stored_sha256: String,
+    pub compression: Compression,
     pub chunk_count: u64,
+    /// A URL template ending in `{chunk_index}` for this artifact only.
+    pub chunk_upload_url: String,
     /// Lowercase hexadecimal bytes, with bit 0 of byte 0 representing chunk 0.
     pub accepted_chunk_bitmap: String,
     pub missing_chunk_indexes: Vec<u64>,
@@ -80,16 +88,58 @@ pub struct ManifestInput {
     pub schema_version: u16,
     pub session: SessionInput,
     pub capture: CaptureInput,
-    pub artifact: ArtifactInput,
+    /// The complete artifact set. New manifests must use this field.
+    #[serde(default)]
+    pub artifacts: Option<Vec<ArtifactInput>>,
+    /// Legacy singleton input accepted only for migration compatibility.
+    #[serde(default)]
+    pub artifact: Option<ArtifactInput>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Canonical v1 manifest. Serialization always emits the ordered
+/// multi-artifact form, even when it contains a single artifact.
+#[derive(Clone, Debug, Serialize)]
 pub struct Manifest {
     pub schema_version: u16,
     pub session: SessionInput,
     pub capture: Capture,
-    pub artifact: Artifact,
+    pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestWire {
+    schema_version: u16,
+    session: SessionInput,
+    capture: Capture,
+    #[serde(default)]
+    artifacts: Option<Vec<Artifact>>,
+    #[serde(default)]
+    artifact: Option<Artifact>,
+}
+
+impl<'de> Deserialize<'de> for Manifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ManifestWire::deserialize(deserializer)?;
+        let artifacts = match (wire.artifacts, wire.artifact) {
+            (Some(artifacts), None) => artifacts,
+            (None, Some(artifact)) => vec![artifact],
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "manifest must contain exactly one of artifacts or legacy artifact",
+                ));
+            }
+        };
+        Ok(Self {
+            schema_version: wire.schema_version,
+            session: wire.session,
+            capture: wire.capture,
+            artifacts,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +221,9 @@ pub struct SnapshotResponse {
     pub snapshot_fingerprint: String,
     pub manifest_sha256: String,
     pub completed_at: String,
+    pub artifact_count: u32,
+    pub total_original_bytes: u64,
+    pub total_stored_bytes: u64,
     pub manifest: Manifest,
     pub artifacts: Vec<ArtifactResponse>,
 }
@@ -178,6 +231,7 @@ pub struct SnapshotResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArtifactResponse {
     pub artifact_id: String,
+    pub artifact_index: u32,
     pub logical_path: String,
     pub media_type: Option<String>,
     pub original_size_bytes: u64,
@@ -200,6 +254,10 @@ pub struct Receipt {
     pub artifact_count: u32,
     pub total_original_bytes: u64,
     pub total_stored_bytes: u64,
+    /// Stored payload bytes accepted for this upload attempt.
+    pub upload_transfer_bytes: u64,
+    /// Unique canonical blob bytes first persisted by this completion.
+    pub newly_persisted_physical_bytes: u64,
     pub completed_at: String,
 }
 

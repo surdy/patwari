@@ -11,10 +11,11 @@ is needed.
 
 ## Running the archive
 
-The service establishes a durable archive identity and provides the initial single-artifact archival
-path. A Munshi installation registers its client UUID, creates an upload with one canonical manifest,
-receives a server-assigned chunk size, streams resumable stored-byte chunks, completes verification,
-and then fetches the immutable snapshot or stored artifact.
+The service establishes a durable archive identity and archives complete multi-artifact snapshots. A
+Munshi installation registers its client UUID, creates an upload with one canonical manifest,
+receives a server-assigned chunk size, streams resumable stored-byte chunks for every declared
+artifact, completes verification of the complete set, and then fetches the immutable snapshot or an
+individual stored artifact.
 
 ```sh
 cargo run -p patwari-server
@@ -50,12 +51,17 @@ Configuration is environment-based and bounded by default:
 | `PATWARI_UPLOAD_CHUNK_SIZE_BYTES` | `4194304` | Fixed server-assigned stored-byte chunk size |
 | `PATWARI_MAX_ARTIFACT_STORED_BYTES` | `1073741824` | Maximum declared compressed artifact size |
 | `PATWARI_MAX_ARTIFACT_ORIGINAL_BYTES` | `4294967296` | Maximum declared decompressed artifact size |
+| `PATWARI_MAX_ARTIFACT_COUNT` | `128` | Maximum artifacts in one snapshot |
+| `PATWARI_MAX_SNAPSHOT_STORED_BYTES` | `4294967296` | Maximum stored-byte sum in one snapshot |
+| `PATWARI_MAX_SNAPSHOT_ORIGINAL_BYTES` | `17179869184` | Maximum original-byte sum in one snapshot |
 | `PATWARI_UPLOAD_EXPIRY` | `24h` | Server-time lifetime of an unfinished upload |
 
 The body limit is 1 KiB–64 MiB, concurrency is 1–256, timeout is 1s–5m, chunk size is
-1 KiB–32 MiB, each artifact limit is 1 byte–8 GiB, and unfinished-upload expiry is 1m–30d.
+1 KiB–32 MiB, each artifact limit is 1 byte–8 GiB, a snapshot is limited to 1,024 artifacts and
+64 GiB per stored/original aggregate, and unfinished-upload expiry is 1m–30d.
 Chunk size must fit the request-body limit, and the configured stored-artifact limit must fit at
-most 65,536 chunks so status bitmaps remain bounded. Durations accept `s`, `m`, `h`, or `d`. The
+most 65,536 chunks per artifact; a snapshot is additionally capped at 262,144 chunks. Durations
+accept `s`, `m`, `h`, or `d`. The
 service verifies both stored and decompressed sizes while streaming; it never trusts a declared
 checksum or size alone.
 
@@ -136,7 +142,7 @@ extraction system itself.
 
 - Owns remote session and snapshot identity.
 - Validates manifests and upload state.
-- Negotiates fixed chunks and streams the one declared artifact to temporary storage with bounded
+- Negotiates fixed chunks and streams every declared artifact to temporary storage with bounded
   resource use.
 - Verifies stored and decompressed original sizes and checksums.
 - Atomically promotes verified blobs into immutable storage.
@@ -219,7 +225,8 @@ their canonical manifests, and their artifacts are immutable after verification.
 
 ### Artifact
 
-One compressed source file belonging to a snapshot.
+One regular byte stream belonging to a snapshot. A snapshot contains an ordered, canonical set of
+artifacts, sorted by logical path.
 
 ```text
 id
@@ -231,8 +238,10 @@ original_sha256
 blob_id
 ```
 
-Logical paths are relative, normalized, and unique within a snapshot. Absolute source paths must
-not be used as artifact identity.
+Logical paths are portable normalized relative paths and unique case-insensitively within a snapshot.
+They use only ASCII letters, digits, `.`, `_`, `-`, and `/`; empty, traversal, absolute, drive,
+device-name, trailing-dot/space, backslash, and non-regular-file notions are rejected. Inputs are
+byte streams only: the API has no file-kind, symlink, device, or filesystem-object field.
 
 ### Blob
 
@@ -249,9 +258,11 @@ snapshot_id
 manifest_hash
 snapshot_fingerprint
 archive_instance_id
-artifact_count (currently one)
+artifact_count
 total_original_bytes
 total_stored_bytes
+upload_transfer_bytes
+newly_persisted_physical_bytes
 completed_at
 receipt_version
 ```
@@ -259,7 +270,13 @@ receipt_version
 This receipt confirms Patwari integrity only. Filesystem replication and backup remain external
 operational responsibilities.
 
-## Single-artifact manifest v1
+`total_original_bytes` and `total_stored_bytes` are logical sums across the immutable snapshot.
+`upload_transfer_bytes` is the stored-byte sum accepted for this upload attempt, while
+`newly_persisted_physical_bytes` counts only unique canonical blob bytes first added by that
+completion. A snapshot response also includes `artifact_count`, `total_original_bytes`, and
+`total_stored_bytes`.
+
+## Multi-artifact manifest v1
 
 ```json
 {
@@ -277,21 +294,35 @@ operational responsibilities.
     "source_agent_version": "1.0.70",
     "munshi_version": "0.1.0"
   },
-  "artifact": {
-    "logical_path": "events.jsonl",
-    "media_type": "application/x-ndjson",
-    "original_size_bytes": 504321,
-    "original_sha256": "sha256:...",
-    "stored_size_bytes": 91234,
-    "stored_sha256": "sha256:...",
-    "compression": "zstd"
-  }
+  "artifacts": [
+    {
+      "logical_path": "events.jsonl",
+      "media_type": "application/x-ndjson",
+      "original_size_bytes": 504321,
+      "original_sha256": "sha256:...",
+      "stored_size_bytes": 91234,
+      "stored_sha256": "sha256:...",
+      "compression": "zstd"
+    },
+    {
+      "logical_path": "metadata.json",
+      "media_type": "application/json",
+      "original_size_bytes": 128,
+      "original_sha256": "sha256:...",
+      "stored_size_bytes": 128,
+      "stored_sha256": "sha256:...",
+      "compression": "identity"
+    }
+  ]
 }
 ```
 
 Hashes are exactly `sha256:` followed by 64 lowercase hexadecimal digits. The server normalizes and
-serializes this document before persisting it; this canonical form is authoritative. Version 1
-accepts exactly one normalized relative regular-file logical path.
+sorts this document by `logical_path` before persisting it; this canonical `artifacts[]` form is
+authoritative and client order does not affect snapshot identity. Version 1 accepts a legacy
+singleton `artifact` input only for compatibility, but never persists that shape for new uploads.
+The snapshot fingerprint contains stable capture context plus each canonical logical path and
+verified original content, excluding capture provenance and stored representation.
 
 ## API v1
 
@@ -305,7 +336,7 @@ PUT    /api/v1/clients/{client_id}
 
 POST   /api/v1/uploads
 GET    /api/v1/uploads/{upload_id}
-PUT    /api/v1/uploads/{upload_id}/artifacts/0/chunks/{chunk_index}
+PUT    /api/v1/uploads/{upload_id}/artifacts/{artifact_index}/chunks/{chunk_index}
 POST   /api/v1/uploads/{upload_id}/abandon
 POST   /api/v1/uploads/{upload_id}/complete
 GET    /api/v1/snapshots/{snapshot_id}
@@ -313,9 +344,10 @@ GET    /api/v1/artifacts/{artifact_id}/content
 ```
 
 `POST /uploads` and `GET /uploads/{upload_id}` report the assigned `chunk_size_bytes` and, for
-each upload artifact, its `chunk_count`, `accepted_chunk_bitmap`, and missing indexes. Bitmap byte
-zero represents chunk indexes 0–7 with the least-significant bit representing index 0. Each `PUT`
-must include `Content-Type: application/octet-stream`, `X-Patwari-Chunk-Length`, and
+each upload artifact, its stable `artifact_index`, logical path, artifact-specific chunk URL
+template, `chunk_count`, `accepted_chunk_bitmap`, and missing indexes. Bitmap byte zero represents
+chunk indexes 0–7 with the least-significant bit representing index 0. Each `PUT` must include
+`Content-Type: application/octet-stream`, `X-Patwari-Chunk-Length`, and
 `X-Patwari-Chunk-SHA256` (`sha256:` plus 64 lowercase hex digits). The server derives the only
 valid length for each index, including the final chunk. For practical compatibility, a headerless
 `chunks/0` request is accepted only when the negotiated artifact has exactly one chunk; its
@@ -335,9 +367,10 @@ chunk checksums, or artifact content.
   returns the existing upload; reusing it for a different manifest returns `409 Conflict`.
 - Session creation is atomic with upload creation and is keyed within the owner namespace by
   `source_agent + source_session_id`.
-- The v1 sole artifact is addressed as artifact index `0` and server-negotiated chunk indexes.
-  Retrying a chunk with the same index, length, and checksum is idempotent; a different length or
-  checksum returns `409 Conflict` without replacing accepted bytes.
+- Artifact indexes are the canonical logical-path order in the manifest, and each has independent
+  server-negotiated chunk indexes. Retrying a chunk with the same artifact/index, length, and
+  checksum is idempotent; a different length or checksum returns `409 Conflict` without replacing
+  accepted bytes.
 - Retrying completion returns byte-for-byte the same versioned receipt, including the persistent
   archive instance ID.
 
@@ -352,18 +385,20 @@ chunk checksums, or artifact content.
 │           └── abcdef...
 ├── uploads/
 │   └── <upload-id>/
-│       └── artifacts/0/chunks/<chunk-index>
+│       └── artifacts/<artifact-index>/chunks/<chunk-index>
 └── maintenance/
 ```
 
 - SQLite stores metadata, state transitions, idempotency records, and audit events.
 - Completed blobs are content-addressed by the checksum of the stored compressed bytes.
-- Snapshot artifacts reference blobs, allowing safe deduplication.
+- Snapshot artifacts reference blobs, allowing safe deduplication, including multiple artifacts in
+  the same snapshot that share one representation.
 - Temporary uploads and completed blobs are on the same filesystem so promotion can use atomic
   hard links and cleanup can be recovered after a crash.
 - Chunk files are synced and linked before their metadata record is committed. Restart recovery
-  removes file-only remnants and makes metadata-only chunks retryable; completion assembles verified
-  chunks into a bounded streaming file before blob promotion.
+  removes file-only remnants and makes metadata-only chunks retryable; completion assembles and
+  independently verifies every declared artifact with bounded streaming before one atomic metadata
+  commit makes the snapshot visible.
 - Database and blob paths live on one dedicated persistent volume.
 - Backup tooling must capture SQLite and blobs consistently. Patwari will provide a maintenance
   command that creates a SQLite online backup and a blob inventory for filesystem-level backup.

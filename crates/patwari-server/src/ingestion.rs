@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     io::{self, Read},
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,10 +16,12 @@ use http_body_util::BodyExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
+use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
+    sync::OwnedMutexGuard,
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -36,8 +38,8 @@ use crate::{
     service::{AppState, MaintenanceError},
     storage::StorageLayout,
     validation::{
-        normalize_manifest, parse_uuid, to_sqlite_i64, validate_client_request, validate_digest,
-        validate_idempotency_key, validate_octet_stream,
+        ManifestLimits, manifest_totals, normalize_manifest, parse_uuid, to_sqlite_i64,
+        validate_client_request, validate_digest, validate_idempotency_key, validate_octet_stream,
     },
 };
 
@@ -45,6 +47,19 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const CHUNK_SHA256_HEADER: &str = "x-patwari-chunk-sha256";
 const CHUNK_LENGTH_HEADER: &str = "x-patwari-chunk-length";
 const LEGACY_EXPIRY_MARKER: &str = "1970-01-01T00:00:00Z";
+const MAX_SNAPSHOT_CHUNK_COUNT: u64 = 262_144;
+
+/// The result of comparing a single immutable manifest to its normalized
+/// Artifact/Blob projection. This intentionally is not a full archive scan.
+#[derive(Debug, Error)]
+pub enum ReconciliationError {
+    #[error("snapshot was not found")]
+    NotFound,
+    #[error("snapshot metadata could not be reconciled")]
+    Drift,
+    #[error("snapshot metadata could not be read")]
+    Metadata,
+}
 
 pub(crate) async fn register_client(
     AxumPath(client_id): AxumPath<String>,
@@ -107,10 +122,15 @@ pub(crate) async fn create_upload(
     validate_idempotency_key(&request.idempotency_key)?;
     let manifest = normalize_manifest(
         request.manifest,
-        state.max_artifact_stored_bytes,
-        state.max_artifact_original_bytes,
+        ManifestLimits {
+            artifact_count: state.max_artifact_count,
+            artifact_stored_bytes: state.max_artifact_stored_bytes,
+            artifact_original_bytes: state.max_artifact_original_bytes,
+            snapshot_stored_bytes: state.max_snapshot_stored_bytes,
+            snapshot_original_bytes: state.max_snapshot_original_bytes,
+        },
     )?;
-    let chunk_count = chunk_count(manifest.artifact.stored_size_bytes, state.chunk_size_bytes)?;
+    let layout = upload_layout(&manifest, state.chunk_size_bytes)?;
     let canonical_json = serde_json::to_string(&manifest).map_err(|_| ApiError::internal())?;
     let manifest_sha256 = sha256_hex(canonical_json.as_bytes());
     let now = OffsetDateTime::now_utc();
@@ -118,8 +138,9 @@ pub(crate) async fn create_upload(
     let expires_at =
         database::expiration_at(now, state.upload_expiry).map_err(|_| ApiError::internal())?;
 
-    // A caller may resume with the same idempotency key after a prior upload has
-    // expired. Expire first so an obsolete active row cannot pin that key.
+    // A caller may resume with the same idempotency key after a prior upload
+    // expired. Expire before looking up that key so it cannot pin a stale
+    // transfer attempt.
     expire_uploads_at(&state, now)
         .await
         .map_err(|_| ApiError::internal())?;
@@ -130,7 +151,7 @@ pub(crate) async fn create_upload(
         &manifest,
         canonical_json,
         &manifest_sha256,
-        chunk_count,
+        &layout,
         &now_text,
         &expires_at,
     )
@@ -142,6 +163,36 @@ pub(crate) async fn create_upload(
         StatusCode::OK
     };
     Ok((status, Json(response)))
+}
+
+#[derive(Clone)]
+struct UploadLayout {
+    chunk_counts: Vec<u64>,
+    total_original_bytes: u64,
+    total_stored_bytes: u64,
+}
+
+fn upload_layout(manifest: &Manifest, chunk_size_bytes: u64) -> Result<UploadLayout, ApiError> {
+    let (total_original_bytes, total_stored_bytes) = manifest_totals(manifest)?;
+    let mut chunk_counts = Vec::with_capacity(manifest.artifacts.len());
+    let mut total_chunks = 0_u64;
+    for artifact in &manifest.artifacts {
+        let count = chunk_count(artifact.stored_size_bytes, chunk_size_bytes)?;
+        total_chunks = total_chunks
+            .checked_add(count)
+            .ok_or_else(|| ApiError::invalid("snapshot chunk count is invalid"))?;
+        if total_chunks > MAX_SNAPSHOT_CHUNK_COUNT {
+            return Err(ApiError::invalid(
+                "snapshot requires more chunks than the bounded upload limit",
+            ));
+        }
+        chunk_counts.push(count);
+    }
+    Ok(UploadLayout {
+        chunk_counts,
+        total_original_bytes,
+        total_stored_bytes,
+    })
 }
 
 struct CreatedUpload {
@@ -157,7 +208,7 @@ async fn persist_upload(
     manifest: &Manifest,
     canonical_json: String,
     manifest_sha256: &str,
-    chunk_count: u64,
+    layout: &UploadLayout,
     now: &str,
     expires_at: &str,
 ) -> Result<CreatedUpload, ApiError> {
@@ -168,19 +219,24 @@ async fn persist_upload(
         .map_err(|_| ApiError::database())?;
     let session_id =
         get_or_create_session(&mut transaction, state, client_id, manifest, now).await?;
-
     let upload_id = Uuid::now_v7().to_string();
-    let initial_status = if chunk_count == 0 {
+    let initial_status = if layout.chunk_counts.iter().all(|count| *count == 0) {
         "artifact_uploaded"
     } else {
         "created"
     };
+    let first = manifest.artifacts.first().ok_or_else(ApiError::internal)?;
+    let first_chunk_count = *layout.chunk_counts.first().ok_or_else(ApiError::internal)?;
+
     let insert = sqlx::query(
         "INSERT INTO uploads (
             id, owner_namespace, session_id, client_id, idempotency_key, manifest_sha256, status,
             created_at, chunk_size_bytes, chunk_count, declared_stored_size_bytes,
-            declared_original_size_bytes, expires_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            declared_original_size_bytes, expires_at, artifact_count, total_stored_size_bytes,
+            total_original_size_bytes
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+         )
          ON CONFLICT(owner_namespace, client_id, idempotency_key) DO NOTHING",
     )
     .bind(&upload_id)
@@ -192,27 +248,30 @@ async fn persist_upload(
     .bind(initial_status)
     .bind(now)
     .bind(to_sqlite_i64(state.chunk_size_bytes)?)
-    .bind(to_sqlite_i64(chunk_count)?)
-    .bind(to_sqlite_i64(manifest.artifact.stored_size_bytes)?)
-    .bind(to_sqlite_i64(manifest.artifact.original_size_bytes)?)
+    .bind(to_sqlite_i64(first_chunk_count)?)
+    .bind(to_sqlite_i64(first.stored_size_bytes)?)
+    .bind(to_sqlite_i64(first.original_size_bytes)?)
     .bind(expires_at)
+    .bind(to_sqlite_i64(
+        u64::try_from(manifest.artifacts.len()).map_err(|_| ApiError::internal())?,
+    )?)
+    .bind(to_sqlite_i64(layout.total_stored_bytes)?)
+    .bind(to_sqlite_i64(layout.total_original_bytes)?)
     .execute(&mut *transaction)
     .await
     .map_err(|_| ApiError::database())?;
 
     let (persisted_id, was_created) = if insert.rows_affected() == 1 {
-        sqlx::query(
-            "INSERT INTO manifests (id, upload_id, canonical_json, sha256, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+        persist_new_upload_detail(
+            &mut transaction,
+            &upload_id,
+            manifest,
+            canonical_json,
+            manifest_sha256,
+            layout,
+            now,
         )
-        .bind(Uuid::now_v7().to_string())
-        .bind(&upload_id)
-        .bind(canonical_json)
-        .bind(manifest_sha256)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| ApiError::database())?;
+        .await?;
         (upload_id, true)
     } else {
         let existing = sqlx::query_as::<_, ExistingUploadRow>(
@@ -225,7 +284,9 @@ async fn persist_upload(
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| ApiError::database())?;
-        if existing.manifest_sha256 != manifest_sha256 {
+        if existing.manifest_sha256 != manifest_sha256
+            && !legacy_manifest_equivalent(&mut transaction, &existing.id, manifest_sha256).await?
+        {
             return Err(ApiError::conflict(
                 "idempotency_conflict",
                 "idempotency key was already used for a different manifest",
@@ -241,6 +302,94 @@ async fn persist_upload(
         upload_id: persisted_id,
         was_created,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_new_upload_detail(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    upload_id: &str,
+    manifest: &Manifest,
+    canonical_json: String,
+    manifest_sha256: &str,
+    layout: &UploadLayout,
+    now: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO manifests (id, upload_id, canonical_json, sha256, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(upload_id)
+    .bind(canonical_json)
+    .bind(manifest_sha256)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::database())?;
+    for (artifact_index, (artifact, chunk_count)) in manifest
+        .artifacts
+        .iter()
+        .zip(&layout.chunk_counts)
+        .enumerate()
+    {
+        insert_upload_artifact(
+            transaction,
+            upload_id,
+            u32::try_from(artifact_index).map_err(|_| ApiError::internal())?,
+            artifact,
+            *chunk_count,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn legacy_manifest_equivalent(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    upload_id: &str,
+    expected_canonical_sha256: &str,
+) -> Result<bool, ApiError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT canonical_json FROM manifests WHERE upload_id = ?1")
+            .bind(upload_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| ApiError::database())?;
+    let Some((json,)) = row else {
+        return Ok(false);
+    };
+    let manifest: Manifest = serde_json::from_str(&json).map_err(|_| ApiError::database())?;
+    let canonical = serde_json::to_vec(&manifest).map_err(|_| ApiError::internal())?;
+    Ok(sha256_hex(&canonical) == expected_canonical_sha256)
+}
+
+async fn insert_upload_artifact(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    upload_id: &str,
+    artifact_index: u32,
+    artifact: &Artifact,
+    chunk_count: u64,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO upload_artifacts (
+            upload_id, artifact_index, logical_path, media_type, original_size_bytes,
+            original_sha256, stored_size_bytes, stored_sha256, compression, chunk_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )
+    .bind(upload_id)
+    .bind(i64::from(artifact_index))
+    .bind(&artifact.logical_path)
+    .bind(&artifact.media_type)
+    .bind(to_sqlite_i64(artifact.original_size_bytes)?)
+    .bind(digest_storage_value(&artifact.original_sha256))
+    .bind(to_sqlite_i64(artifact.stored_size_bytes)?)
+    .bind(digest_storage_value(&artifact.stored_sha256))
+    .bind(compression_name(artifact.compression))
+    .bind(to_sqlite_i64(chunk_count)?)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::database())?;
+    Ok(())
 }
 
 async fn get_or_create_session(
@@ -299,7 +448,7 @@ pub(crate) async fn get_upload_status(
     let lock = state.upload_lock(&upload_id);
     let _guard = lock.lock().await;
     if let Some(upload) = get_active_upload(&state.database, &upload_id).await? {
-        if is_expired(&upload, OffsetDateTime::now_utc())? {
+        if upload.status != "completed" && is_expired(&upload, OffsetDateTime::now_utc())? {
             terminalize_upload_locked(&state, &upload, TerminalReason::Expired).await?;
             return audit_upload_response(&state.database, &upload_id)
                 .await
@@ -315,12 +464,13 @@ pub(crate) async fn get_upload_status(
 }
 
 pub(crate) async fn put_artifact_chunk(
-    AxumPath((upload_id, chunk_index)): AxumPath<(String, String)>,
+    AxumPath((upload_id, artifact_index, chunk_index)): AxumPath<(String, String, String)>,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     let upload_id = parse_uuid(&upload_id, "upload identifier is not a UUID")?.to_string();
+    let artifact_index = parse_artifact_index(&artifact_index)?;
     let chunk_index = chunk_index
         .parse::<u64>()
         .map_err(|_| ApiError::invalid("chunk index is not a non-negative integer"))?;
@@ -335,11 +485,18 @@ pub(crate) async fn put_artifact_chunk(
             "completed uploads do not accept artifact bytes",
         ));
     }
+    let artifact = get_upload_artifact(&state.database, &upload_id, artifact_index)
+        .await?
+        .ok_or_else(|| {
+            ApiError::invalid("artifact index is outside the negotiated artifact range")
+        })?;
     let request_chunk = match parse_chunk_headers(&headers)? {
         Some(request) => request,
-        None => legacy_single_chunk_request(&state.database, &upload, chunk_index).await?,
+        None => legacy_single_chunk_request(&upload, &artifact, artifact_index, chunk_index)?,
     };
-    if let Some(existing) = get_chunk(&state.database, &upload_id, chunk_index).await? {
+    if let Some(existing) =
+        get_chunk(&state.database, &upload_id, artifact_index, chunk_index).await?
+    {
         if existing.byte_length != to_sqlite_i64(request_chunk.byte_length)?
             || existing.sha256 != digest_storage_value(&request_chunk.sha256)
         {
@@ -349,64 +506,37 @@ pub(crate) async fn put_artifact_chunk(
             ));
         }
         verify_stored_file(
-            state.storage.chunk_path(&upload_id, chunk_index),
+            state
+                .storage
+                .artifact_chunk_path(&upload_id, artifact_index, chunk_index),
             request_chunk.byte_length,
             &request_chunk.sha256,
         )
         .await?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    let expected_length = expected_chunk_length(&upload, chunk_index)?;
+    let expected_length = expected_chunk_length(&upload, &artifact, chunk_index)?;
     if request_chunk.byte_length != expected_length {
         return Err(ApiError::invalid(
             "chunk length does not match the negotiated chunk layout",
         ));
     }
 
-    state
-        .storage
-        .ensure_chunk_dir(&upload_id)
-        .await
-        .map_err(|_| ApiError::storage())?;
-    let temporary_path = state.storage.staged_chunk_path(&upload_id);
-    let write_result = write_chunk_body(body, &temporary_path, &request_chunk).await;
-    if let Err(error) = write_result {
-        let _ = StorageLayout::remove_file(&temporary_path).await;
-        return Err(error);
-    }
-
-    let final_path = state.storage.chunk_path(&upload_id, chunk_index);
-    // Files precede metadata: an interrupted write can leave only an orphan
-    // file, which restart recovery removes. Reversing this order could make a
-    // committed accepted record point to bytes that never became durable.
-    let created_file = match fs::hard_link(&temporary_path, &final_path).await {
-        Ok(()) => true,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-        Err(_) => {
-            let _ = StorageLayout::remove_file(&temporary_path).await;
-            return Err(ApiError::storage());
-        }
-    };
-    if !created_file
-        && verify_stored_file(
-            final_path.clone(),
-            request_chunk.byte_length,
-            &request_chunk.sha256,
-        )
-        .await
-        .is_err()
-    {
-        let _ = StorageLayout::remove_file(&temporary_path).await;
-        return Err(ApiError::conflict(
-            "chunk_conflict",
-            "this chunk index was already accepted with a different length or checksum",
-        ));
-    }
+    let temporary_path = store_chunk_file(
+        &state,
+        &upload_id,
+        artifact_index,
+        chunk_index,
+        body,
+        &request_chunk,
+    )
+    .await?;
 
     let now = now_rfc3339().map_err(|_| ApiError::internal())?;
     let accepted = persist_chunk_record(
         &state,
         &upload,
+        artifact_index,
         chunk_index,
         request_chunk.byte_length,
         &request_chunk.sha256,
@@ -426,6 +556,58 @@ pub(crate) async fn put_artifact_chunk(
 struct ChunkRequest {
     byte_length: u64,
     sha256: String,
+}
+
+async fn store_chunk_file(
+    state: &AppState,
+    upload_id: &str,
+    artifact_index: u32,
+    chunk_index: u64,
+    body: Body,
+    request_chunk: &ChunkRequest,
+) -> Result<PathBuf, ApiError> {
+    state
+        .storage
+        .ensure_chunk_dir(upload_id, artifact_index)
+        .await
+        .map_err(|_| ApiError::storage())?;
+    let temporary_path = state.storage.staged_chunk_path(upload_id, artifact_index);
+    if let Err(error) = write_chunk_body(body, &temporary_path, request_chunk).await {
+        let _ = StorageLayout::remove_file(&temporary_path).await;
+        return Err(error);
+    }
+
+    let final_path = state
+        .storage
+        .artifact_chunk_path(upload_id, artifact_index, chunk_index);
+    // Files precede metadata. A crash can therefore leave an orphaned file,
+    // which recovery removes, but never a durable row that points at bytes
+    // that were not fully written and synced.
+    let created_file = match fs::hard_link(&temporary_path, &final_path).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(_) => {
+            let _ = StorageLayout::remove_file(&temporary_path).await;
+            return Err(ApiError::storage());
+        }
+    };
+    if created_file && sync_parent_directory(&final_path).await.is_err() {
+        let _ = StorageLayout::remove_file(&temporary_path).await;
+        let _ = StorageLayout::remove_file(&final_path).await;
+        return Err(ApiError::storage());
+    }
+    if !created_file
+        && verify_stored_file(final_path, request_chunk.byte_length, &request_chunk.sha256)
+            .await
+            .is_err()
+    {
+        let _ = StorageLayout::remove_file(&temporary_path).await;
+        return Err(ApiError::conflict(
+            "chunk_conflict",
+            "this chunk index was already accepted with a different length or checksum",
+        ));
+    }
+    Ok(temporary_path)
 }
 
 fn parse_chunk_headers(headers: &HeaderMap) -> Result<Option<ChunkRequest>, ApiError> {
@@ -463,26 +645,32 @@ fn optional_header<'a>(
         .transpose()
 }
 
-async fn legacy_single_chunk_request(
-    database: &SqlitePool,
+fn legacy_single_chunk_request(
     upload: &ActiveUploadRow,
+    artifact: &UploadArtifactRow,
+    artifact_index: u32,
     chunk_index: u64,
 ) -> Result<ChunkRequest, ApiError> {
-    if upload.chunk_count != 1 || chunk_index != 0 {
+    if upload.artifact_count != 1
+        || artifact_index != 0
+        || artifact.chunk_count != 1
+        || chunk_index != 0
+    {
         return Err(ApiError::invalid(
             "chunk checksum and length headers are required",
         ));
     }
-    let manifest = get_upload_manifest(database, &upload.id).await?;
     Ok(ChunkRequest {
-        byte_length: manifest.artifact.stored_size_bytes,
-        sha256: manifest.artifact.stored_sha256,
+        byte_length: u64::try_from(artifact.stored_size_bytes).map_err(|_| ApiError::internal())?,
+        sha256: digest_document_value(&artifact.stored_sha256),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_chunk_record(
     state: &AppState,
     upload: &ActiveUploadRow,
+    artifact_index: u32,
     chunk_index: u64,
     byte_length: u64,
     sha256: &str,
@@ -510,10 +698,11 @@ async fn persist_chunk_record(
     let inserted = sqlx::query(
         "INSERT INTO upload_chunks (
             upload_id, artifact_index, chunk_index, byte_length, sha256, accepted_at
-         ) VALUES (?1, 0, ?2, ?3, ?4, ?5)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(upload_id, artifact_index, chunk_index) DO NOTHING",
     )
     .bind(&upload.id)
+    .bind(i64::from(artifact_index))
     .bind(to_sqlite_i64(chunk_index)?)
     .bind(to_sqlite_i64(byte_length)?)
     .bind(digest_storage_value(sha256))
@@ -525,9 +714,10 @@ async fn persist_chunk_record(
     if inserted.rows_affected() == 0 {
         let existing = sqlx::query_as::<_, ChunkRow>(
             "SELECT chunk_index, byte_length, sha256 FROM upload_chunks
-             WHERE upload_id = ?1 AND artifact_index = 0 AND chunk_index = ?2",
+             WHERE upload_id = ?1 AND artifact_index = ?2 AND chunk_index = ?3",
         )
         .bind(&upload.id)
+        .bind(i64::from(artifact_index))
         .bind(to_sqlite_i64(chunk_index)?)
         .fetch_one(&mut *transaction)
         .await
@@ -552,14 +742,7 @@ async fn refresh_upload_status(
     database: &SqlitePool,
     upload: &ActiveUploadRow,
 ) -> Result<(), ApiError> {
-    let accepted: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM upload_chunks WHERE upload_id = ?1 AND artifact_index = 0",
-    )
-    .bind(&upload.id)
-    .fetch_one(database)
-    .await
-    .map_err(|_| ApiError::database())?;
-    let complete = accepted.0 == upload.chunk_count;
+    let complete = upload_is_complete(database, &upload.id).await?;
     let desired_status = if complete {
         "artifact_uploaded"
     } else {
@@ -575,6 +758,32 @@ async fn refresh_upload_status(
     .await
     .map_err(|_| ApiError::database())?;
     Ok(())
+}
+
+async fn upload_is_complete(database: &SqlitePool, upload_id: &str) -> Result<bool, ApiError> {
+    let artifacts = get_upload_artifacts(database, upload_id).await?;
+    if artifacts.is_empty() {
+        return Err(ApiError::database());
+    }
+    for artifact in artifacts {
+        let accepted: (i64, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(chunk_index), MAX(chunk_index)
+             FROM upload_chunks WHERE upload_id = ?1 AND artifact_index = ?2",
+        )
+        .bind(upload_id)
+        .bind(artifact.artifact_index)
+        .fetch_one(database)
+        .await
+        .map_err(|_| ApiError::database())?;
+        let expected_last = artifact.chunk_count.checked_sub(1);
+        if accepted.0 != artifact.chunk_count
+            || (artifact.chunk_count == 0 && (accepted.1.is_some() || accepted.2.is_some()))
+            || (artifact.chunk_count > 0 && (accepted.1 != Some(0) || accepted.2 != expected_last))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) async fn abandon_upload(
@@ -662,8 +871,11 @@ async fn terminalize_upload_locked(
         "INSERT INTO upload_audits (
             upload_id, owner_namespace, client_id, session_id, declared_original_size_bytes,
             declared_stored_size_bytes, chunk_size_bytes, chunk_count, created_at, terminal_at,
-            terminal_reason, error_code
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            terminal_reason, error_code, artifact_count, total_original_size_bytes,
+            total_stored_size_bytes
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+         )
          ON CONFLICT(upload_id) DO NOTHING",
     )
     .bind(&upload.id)
@@ -678,13 +890,15 @@ async fn terminalize_upload_locked(
     .bind(&terminal_at)
     .bind(reason.as_str())
     .bind(reason.error_code())
+    .bind(upload.artifact_count)
+    .bind(upload.total_original_size_bytes)
+    .bind(upload.total_stored_size_bytes)
     .execute(&mut *transaction)
     .await
     .map_err(|_| ApiError::database())?;
 
-    // Delete database detail before deleting bytes. If the process stops after
-    // this commit, recovery sees the audit record and removes the orphaned
-    // upload directory. The reverse order would lose the durable cleanup work.
+    // Delete detail before deleting bytes. After a crash, the redacted audit
+    // row makes any remaining upload directory disposable during bootstrap.
     sqlx::query("DELETE FROM upload_chunks WHERE upload_id = ?1")
         .bind(&upload.id)
         .execute(&mut *transaction)
@@ -777,7 +991,7 @@ async fn active_upload_response(
     let upload = get_active_upload(&state.database, upload_id)
         .await?
         .ok_or_else(|| ApiError::not_found("upload_not_found", "upload was not found"))?;
-    let artifact = upload_artifact_status(&state.database, &upload).await?;
+    let artifacts = upload_artifact_statuses(&state.database, &upload).await?;
     Ok(UploadResponse {
         artifact_upload_url: format!("/api/v1/uploads/{upload_id}/artifacts/0/chunks/0"),
         status_url: format!("/api/v1/uploads/{upload_id}"),
@@ -789,7 +1003,7 @@ async fn active_upload_response(
         manifest_sha256: digest_document_value(&upload.manifest_sha256),
         chunk_size_bytes: u64::try_from(upload.chunk_size_bytes)
             .map_err(|_| ApiError::internal())?,
-        artifacts: vec![artifact],
+        artifacts,
     })
 }
 
@@ -797,7 +1011,7 @@ async fn active_upload_status_response(
     state: &AppState,
     upload: &ActiveUploadRow,
 ) -> Result<UploadStatusResponse, ApiError> {
-    let artifact = upload_artifact_status(&state.database, upload).await?;
+    let artifacts = upload_artifact_statuses(&state.database, upload).await?;
     Ok(UploadStatusResponse {
         status_url: format!("/api/v1/uploads/{}", upload.id),
         abandon_url: format!("/api/v1/uploads/{}/abandon", upload.id),
@@ -808,7 +1022,7 @@ async fn active_upload_status_response(
         manifest_sha256: Some(digest_document_value(&upload.manifest_sha256)),
         chunk_size_bytes: u64::try_from(upload.chunk_size_bytes)
             .map_err(|_| ApiError::internal())?,
-        artifacts: vec![artifact],
+        artifacts,
     })
 }
 
@@ -840,21 +1054,38 @@ async fn audit_upload_response(
         manifest_sha256: None,
         chunk_size_bytes: u64::try_from(audit.chunk_size_bytes)
             .map_err(|_| ApiError::internal())?,
-        // Terminal audit rows intentionally expose no chunk detail.
+        // Terminal audit rows deliberately expose neither paths nor chunk
+        // detail, even for a multi-artifact transfer.
         artifacts: Vec::new(),
     })
 }
 
-async fn upload_artifact_status(
+async fn upload_artifact_statuses(
     database: &SqlitePool,
     upload: &ActiveUploadRow,
+) -> Result<Vec<UploadArtifactStatus>, ApiError> {
+    let rows = get_upload_artifacts(database, &upload.id).await?;
+    let mut statuses = Vec::with_capacity(rows.len());
+    for artifact in &rows {
+        statuses.push(upload_artifact_status(database, &upload.id, artifact).await?);
+    }
+    Ok(statuses)
+}
+
+async fn upload_artifact_status(
+    database: &SqlitePool,
+    upload_id: &str,
+    artifact: &UploadArtifactRow,
 ) -> Result<UploadArtifactStatus, ApiError> {
-    let chunk_count = u64::try_from(upload.chunk_count).map_err(|_| ApiError::internal())?;
+    let artifact_index =
+        u32::try_from(artifact.artifact_index).map_err(|_| ApiError::internal())?;
+    let chunk_count = u64::try_from(artifact.chunk_count).map_err(|_| ApiError::internal())?;
     let rows = sqlx::query_as::<_, ChunkRow>(
         "SELECT chunk_index, byte_length, sha256 FROM upload_chunks
-         WHERE upload_id = ?1 AND artifact_index = 0 ORDER BY chunk_index",
+         WHERE upload_id = ?1 AND artifact_index = ?2 ORDER BY chunk_index",
     )
-    .bind(&upload.id)
+    .bind(upload_id)
+    .bind(artifact.artifact_index)
     .fetch_all(database)
     .await
     .map_err(|_| ApiError::database())?;
@@ -875,16 +1106,26 @@ async fn upload_artifact_status(
     }
     let missing_chunk_indexes = (0..chunk_count)
         .filter(|index| {
-            let byte = usize::try_from(*index / 8).expect("configured chunk count fits usize");
+            let byte = usize::try_from(*index / 8).expect("bounded chunk count fits usize");
             let bit = u32::try_from(*index % 8).expect("bit index fits u32");
             bitmap[byte] & (1_u8 << bit) == 0
         })
         .collect();
     Ok(UploadArtifactStatus {
-        artifact_index: 0,
-        stored_size_bytes: u64::try_from(upload.declared_stored_size_bytes)
+        artifact_index,
+        logical_path: artifact.logical_path.clone(),
+        media_type: artifact.media_type.clone(),
+        original_size_bytes: u64::try_from(artifact.original_size_bytes)
             .map_err(|_| ApiError::internal())?,
+        original_sha256: digest_document_value(&artifact.original_sha256),
+        stored_size_bytes: u64::try_from(artifact.stored_size_bytes)
+            .map_err(|_| ApiError::internal())?,
+        stored_sha256: digest_document_value(&artifact.stored_sha256),
+        compression: parse_compression(&artifact.compression).map_err(|()| ApiError::internal())?,
         chunk_count,
+        chunk_upload_url: format!(
+            "/api/v1/uploads/{upload_id}/artifacts/{artifact_index}/chunks/{{chunk_index}}"
+        ),
         accepted_chunk_bitmap: hex_digest(bitmap),
         missing_chunk_indexes,
     })
@@ -908,112 +1149,217 @@ pub(crate) async fn complete_upload(
     let _guard = lock.lock().await;
     let upload = require_active_upload(&state, &upload_id).await?;
     if upload.status == "completed" {
-        let snapshot_id = upload.snapshot_id.ok_or_else(ApiError::internal)?;
-        return receipt_for_snapshot(&state, &snapshot_id).await.map(Json);
+        return receipt_for_upload(&state, &upload_id).await.map(Json);
     }
 
     let manifest = get_upload_manifest(&state.database, &upload_id).await?;
-    validate_current_artifact_limits(&state, &manifest)?;
-    let assembled_path = state.storage.assembled_path(&upload_id);
-    let assembled = assemble_upload(&state, &upload, &manifest, &assembled_path).await;
-    if let Err(error) = assembled {
-        let _ = StorageLayout::remove_file(&assembled_path).await;
-        return Err(error);
-    }
-    if let Err(error) = verify_artifact(&assembled_path, &manifest.artifact).await {
-        let _ = StorageLayout::remove_file(&assembled_path).await;
-        return Err(error);
-    }
-
+    validate_current_manifest_limits(&state, &manifest)?;
+    let artifacts = get_upload_artifacts(&state.database, &upload_id).await?;
+    validate_upload_projection(&manifest, &artifacts, &upload)?;
+    let prepared = prepare_artifacts(&state, &upload, &manifest, &artifacts).await?;
+    let (_, transfer_bytes) = manifest_totals(&manifest)?;
     let fingerprint = snapshot_fingerprint(&manifest)?;
 
-    // Resolve any already-committed snapshot for this session/fingerprint
-    // before promoting a permanent blob. A duplicate completion that
-    // assembled a different (but equally valid) stored representation of
-    // the same original bytes must never promote that alternate
-    // representation to permanent storage or create a blob row for it: the
-    // fingerprint depends only on stable session/capture/original-artifact
-    // fields, so a match here always already has a durable artifact+blob.
+    // Fully verify every stored and original stream before deciding semantic
+    // deduplication. A duplicate snapshot cannot be used to mask a corrupt
+    // or incomplete artifact.
     if let Some(snapshot_id) =
         find_snapshot_by_fingerprint(&state, &upload.session_id, &fingerprint).await?
     {
-        let _ = StorageLayout::remove_file(&assembled_path).await;
-        finalize_upload_for_existing_snapshot(&state, &upload_id, &snapshot_id).await?;
-        state
-            .storage
-            .remove_upload_dir(&upload_id)
-            .await
-            .map_err(|_| ApiError::storage())?;
-        return receipt_for_snapshot(&state, &snapshot_id).await.map(Json);
+        cleanup_prepared(&prepared).await;
+        finalize_upload_for_existing_snapshot(&state, &upload_id, &snapshot_id, transfer_bytes)
+            .await?;
+        let _ = state.storage.remove_upload_dir(&upload_id).await;
+        return receipt_for_upload(&state, &upload_id).await.map(Json);
     }
 
-    // Every operation that promotes, verifies/reuses, creates/references, or
-    // conditionally deletes the canonical blob file for this digest must run
-    // under this same lock for its whole critical section: otherwise a
-    // third party racing on the same `stored_sha256` could commit a new
-    // blob/artifact reference in the gap between this task discovering it
-    // lost a snapshot race and deleting the file it had just promoted,
-    // leaving that new reference dangling. Acquired after the upload lock
-    // (never the reverse) so the two lock families cannot deadlock; see the
-    // ordering note on `AppState::blob_lock`.
-    let blob_lock = state.blob_lock(
-        &state.identity.owner_namespace,
-        digest_storage_value(&manifest.artifact.stored_sha256),
-    );
-    // Test-only: lets a test confirm this task has reached the exact point
-    // where it attempts to acquire the per-digest lock, without any
-    // dependence on scheduling timing.
-    #[cfg(test)]
-    if let Some(checkpoint) = state.test_hooks.before_blob_lock_attempt() {
-        checkpoint.mark_reached();
-    }
-    let blob_guard = blob_lock.lock().await;
-    if let Err(error) = promote_blob(
-        &state.storage,
-        &assembled_path,
-        &manifest.artifact.stored_sha256,
-        manifest.artifact.stored_size_bytes,
-    )
-    .await
+    let unique = unique_stored_artifacts(&prepared);
+    let digests = unique
+        .iter()
+        .map(|prepared| digest_storage_value(&prepared.artifact.stored_sha256).to_owned())
+        .collect::<Vec<_>>();
+    let blob_guards = acquire_blob_locks(&state, &digests).await;
+
+    // A completion with a different stored representation does not share a
+    // blob lock with the winner, so recheck after obtaining this set's locks.
+    if let Some(snapshot_id) =
+        find_snapshot_by_fingerprint(&state, &upload.session_id, &fingerprint).await?
     {
-        let _ = StorageLayout::remove_file(&assembled_path).await;
-        return Err(error);
+        cleanup_prepared(&prepared).await;
+        finalize_upload_for_existing_snapshot(&state, &upload_id, &snapshot_id, transfer_bytes)
+            .await?;
+        drop(blob_guards);
+        let _ = state.storage.remove_upload_dir(&upload_id).await;
+        return receipt_for_upload(&state, &upload_id).await.map(Json);
     }
-    let snapshot_id =
-        record_completed_upload(&state, &upload_id, &upload, &manifest, &fingerprint).await?;
-    drop(blob_guard);
 
-    // Metadata commits before cleanup. A crash here leaves only recoverable
-    // upload-scoped temporary files; bootstrap removes them for completed rows.
-    state
-        .storage
-        .remove_upload_dir(&upload_id)
-        .await
-        .map_err(|_| ApiError::storage())?;
-    receipt_for_snapshot(&state, &snapshot_id).await.map(Json)
+    let promotions = match promote_unique_blobs(&state, &unique).await {
+        Ok(promotions) => promotions,
+        Err(error) => {
+            cleanup_prepared(&prepared).await;
+            drop(blob_guards);
+            return Err(error);
+        }
+    };
+    let newly_persisted_bytes = promotions
+        .iter()
+        .filter(|promotion| promotion.created)
+        .try_fold(0_u64, |total, promotion| {
+            total
+                .checked_add(promotion.stored_size_bytes)
+                .ok_or_else(ApiError::internal)
+        })?;
+
+    let completion = record_completed_upload(
+        &state,
+        &upload_id,
+        &upload,
+        &manifest,
+        &prepared,
+        &promotions,
+        &fingerprint,
+        transfer_bytes,
+        newly_persisted_bytes,
+    )
+    .await;
+    match completion {
+        Ok(()) => {}
+        Err(error) => {
+            let _ = cleanup_uncommitted_promotions(&state, &promotions).await;
+            cleanup_prepared(&prepared).await;
+            drop(blob_guards);
+            return Err(error);
+        }
+    }
+    drop(blob_guards);
+
+    // Metadata is committed before temporary cleanup. A crash now leaves only
+    // upload-scoped leftovers that bootstrap removes; the snapshot and all
+    // of its normalized artifact rows became visible in one transaction.
+    let _ = state.storage.remove_upload_dir(&upload_id).await;
+    receipt_for_upload(&state, &upload_id).await.map(Json)
 }
 
-fn validate_current_artifact_limits(state: &AppState, manifest: &Manifest) -> Result<(), ApiError> {
-    if manifest.artifact.stored_size_bytes > state.max_artifact_stored_bytes {
+fn validate_current_manifest_limits(state: &AppState, manifest: &Manifest) -> Result<(), ApiError> {
+    if manifest.artifacts.is_empty() || manifest.artifacts.len() > state.max_artifact_count {
         return Err(ApiError::invalid(
-            "artifact stored size exceeds the configured bounded limit",
+            "manifest artifact count exceeds the configured bounded limit",
         ));
     }
-    if manifest.artifact.original_size_bytes > state.max_artifact_original_bytes {
+    let (original, stored) = manifest_totals(manifest)?;
+    if original > state.max_snapshot_original_bytes {
         return Err(ApiError::invalid(
-            "artifact original size exceeds the configured bounded limit",
+            "snapshot original size exceeds the configured bounded limit",
         ));
+    }
+    if stored > state.max_snapshot_stored_bytes {
+        return Err(ApiError::invalid(
+            "snapshot stored size exceeds the configured bounded limit",
+        ));
+    }
+    for artifact in &manifest.artifacts {
+        if artifact.stored_size_bytes > state.max_artifact_stored_bytes {
+            return Err(ApiError::invalid(
+                "artifact stored size exceeds the configured bounded limit",
+            ));
+        }
+        if artifact.original_size_bytes > state.max_artifact_original_bytes {
+            return Err(ApiError::invalid(
+                "artifact original size exceeds the configured bounded limit",
+            ));
+        }
+    }
+    let _ = upload_layout(manifest, state.chunk_size_bytes)?;
+    Ok(())
+}
+
+fn validate_upload_projection(
+    manifest: &Manifest,
+    rows: &[UploadArtifactRow],
+    upload: &ActiveUploadRow,
+) -> Result<(), ApiError> {
+    if manifest.artifacts.len() != rows.len()
+        || i64::try_from(rows.len()).map_err(|_| ApiError::internal())? != upload.artifact_count
+    {
+        return Err(ApiError::conflict(
+            "upload_artifact_projection_invalid",
+            "upload artifact metadata does not match the canonical manifest",
+        ));
+    }
+    let chunk_size = u64::try_from(upload.chunk_size_bytes).map_err(|_| ApiError::internal())?;
+    for (index, (artifact, row)) in manifest.artifacts.iter().zip(rows).enumerate() {
+        if row.artifact_index != i64::try_from(index).map_err(|_| ApiError::internal())?
+            || row.logical_path != artifact.logical_path
+            || row.media_type != artifact.media_type
+            || row.original_size_bytes != to_sqlite_i64(artifact.original_size_bytes)?
+            || row.original_sha256 != digest_storage_value(&artifact.original_sha256)
+            || row.stored_size_bytes != to_sqlite_i64(artifact.stored_size_bytes)?
+            || row.stored_sha256 != digest_storage_value(&artifact.stored_sha256)
+            || row.compression != compression_name(artifact.compression)
+            || row.chunk_count
+                != to_sqlite_i64(chunk_count(artifact.stored_size_bytes, chunk_size)?)?
+        {
+            return Err(ApiError::conflict(
+                "upload_artifact_projection_invalid",
+                "upload artifact metadata does not match the canonical manifest",
+            ));
+        }
     }
     Ok(())
 }
 
-async fn assemble_upload(
+#[derive(Clone)]
+struct PreparedArtifact {
+    artifact_index: u32,
+    artifact: Artifact,
+    assembled_path: PathBuf,
+}
+
+async fn prepare_artifacts(
     state: &AppState,
     upload: &ActiveUploadRow,
     manifest: &Manifest,
+    rows: &[UploadArtifactRow],
+) -> Result<Vec<PreparedArtifact>, ApiError> {
+    let mut prepared = Vec::with_capacity(manifest.artifacts.len());
+    for (artifact, row) in manifest.artifacts.iter().zip(rows) {
+        let artifact_index = u32::try_from(row.artifact_index).map_err(|_| ApiError::internal())?;
+        let assembled_path = state
+            .storage
+            .assembled_artifact_path(&upload.id, artifact_index);
+        let result = async {
+            assemble_artifact(state, upload, row, artifact, &assembled_path).await?;
+            verify_artifact(&assembled_path, artifact).await
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = StorageLayout::remove_file(&assembled_path).await;
+            cleanup_prepared(&prepared).await;
+            return Err(error);
+        }
+        prepared.push(PreparedArtifact {
+            artifact_index,
+            artifact: artifact.clone(),
+            assembled_path,
+        });
+    }
+    Ok(prepared)
+}
+
+async fn cleanup_prepared(prepared: &[PreparedArtifact]) {
+    for artifact in prepared {
+        let _ = StorageLayout::remove_file(&artifact.assembled_path).await;
+    }
+}
+
+async fn assemble_artifact(
+    state: &AppState,
+    upload: &ActiveUploadRow,
+    artifact_row: &UploadArtifactRow,
+    artifact: &Artifact,
     destination: &Path,
 ) -> Result<(), ApiError> {
-    let chunks = accepted_chunk_layout(&state.database, upload).await?;
+    let chunks = accepted_chunk_layout(&state.database, &upload.id, artifact_row, upload).await?;
     let parent = destination.parent().ok_or_else(ApiError::storage)?;
     fs::create_dir_all(parent)
         .await
@@ -1028,15 +1374,23 @@ async fn assemble_upload(
     let mut artifact_hasher = Sha256::new();
     let mut artifact_size = 0_u64;
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    let artifact_index =
+        u32::try_from(artifact_row.artifact_index).map_err(|_| ApiError::internal())?;
 
     for chunk in chunks {
         let expected_length = u64::try_from(chunk.byte_length).map_err(|_| ApiError::internal())?;
-        let mut file = fs::File::open(state.storage.chunk_path(
-            &upload.id,
-            u64::try_from(chunk.chunk_index).map_err(|_| ApiError::internal())?,
-        ))
-        .await
-        .map_err(|_| {
+        let chunk_index = u64::try_from(chunk.chunk_index).map_err(|_| ApiError::internal())?;
+        let chunk_path = state
+            .storage
+            .artifact_chunk_path(&upload.id, artifact_index, chunk_index);
+        if !is_regular_file(&chunk_path).await {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "chunk_missing",
+                "an accepted chunk is no longer available",
+            ));
+        }
+        let mut file = fs::File::open(chunk_path).await.map_err(|_| {
             ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "chunk_missing",
@@ -1053,28 +1407,27 @@ async fn assemble_upload(
             if read == 0 {
                 break;
             }
-            let read = u64::try_from(read).map_err(|_| ApiError::internal())?;
+            let read_u64 = u64::try_from(read).map_err(|_| ApiError::internal())?;
             chunk_size = chunk_size
-                .checked_add(read)
+                .checked_add(read_u64)
                 .ok_or_else(|| ApiError::invalid("chunk size is invalid"))?;
             if chunk_size > expected_length {
                 return Err(chunk_checksum_error());
             }
             artifact_size = artifact_size
-                .checked_add(read)
+                .checked_add(read_u64)
                 .ok_or_else(|| ApiError::invalid("artifact size is invalid"))?;
-            if artifact_size > manifest.artifact.stored_size_bytes {
+            if artifact_size > artifact.stored_size_bytes {
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "artifact_stored_checksum_mismatch",
                     "assembled artifact exceeds its declared stored size",
                 ));
             }
-            let read_usize = usize::try_from(read).map_err(|_| ApiError::internal())?;
-            chunk_hasher.update(&buffer[..read_usize]);
-            artifact_hasher.update(&buffer[..read_usize]);
+            chunk_hasher.update(&buffer[..read]);
+            artifact_hasher.update(&buffer[..read]);
             writer
-                .write_all(&buffer[..read_usize])
+                .write_all(&buffer[..read])
                 .await
                 .map_err(|_| ApiError::storage())?;
         }
@@ -1088,9 +1441,8 @@ async fn assemble_upload(
         .sync_all()
         .await
         .map_err(|_| ApiError::storage())?;
-    if artifact_size != manifest.artifact.stored_size_bytes
-        || hex_digest(artifact_hasher.finalize())
-            != digest_storage_value(&manifest.artifact.stored_sha256)
+    if artifact_size != artifact.stored_size_bytes
+        || hex_digest(artifact_hasher.finalize()) != digest_storage_value(&artifact.stored_sha256)
     {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1103,17 +1455,20 @@ async fn assemble_upload(
 
 async fn accepted_chunk_layout(
     database: &SqlitePool,
+    upload_id: &str,
+    artifact: &UploadArtifactRow,
     upload: &ActiveUploadRow,
 ) -> Result<Vec<ChunkRow>, ApiError> {
     let rows = sqlx::query_as::<_, ChunkRow>(
         "SELECT chunk_index, byte_length, sha256 FROM upload_chunks
-         WHERE upload_id = ?1 AND artifact_index = 0 ORDER BY chunk_index",
+         WHERE upload_id = ?1 AND artifact_index = ?2 ORDER BY chunk_index",
     )
-    .bind(&upload.id)
+    .bind(upload_id)
+    .bind(artifact.artifact_index)
     .fetch_all(database)
     .await
     .map_err(|_| ApiError::database())?;
-    let expected_count = u64::try_from(upload.chunk_count).map_err(|_| ApiError::internal())?;
+    let expected_count = u64::try_from(artifact.chunk_count).map_err(|_| ApiError::internal())?;
     if rows.len() != usize::try_from(expected_count).map_err(|_| ApiError::internal())? {
         return Err(ApiError::conflict(
             "artifact_incomplete",
@@ -1129,7 +1484,7 @@ async fn accepted_chunk_layout(
                 "accepted chunks contain a gap or overlap",
             ));
         }
-        let expected_length = expected_chunk_length(upload, actual_index)?;
+        let expected_length = expected_chunk_length(upload, artifact, actual_index)?;
         if row.byte_length != to_sqlite_i64(expected_length)? {
             return Err(ApiError::conflict(
                 "chunk_layout_invalid",
@@ -1154,6 +1509,78 @@ fn chunk_checksum_error() -> ApiError {
     )
 }
 
+fn unique_stored_artifacts(prepared: &[PreparedArtifact]) -> Vec<&PreparedArtifact> {
+    let mut by_digest = BTreeMap::new();
+    for artifact in prepared {
+        by_digest
+            .entry(digest_storage_value(&artifact.artifact.stored_sha256).to_owned())
+            .or_insert(artifact);
+    }
+    by_digest.into_values().collect()
+}
+
+async fn acquire_blob_locks(state: &AppState, digests: &[String]) -> Vec<OwnedMutexGuard<()>> {
+    let locks = state.blob_locks_for_digests(&state.identity.owner_namespace, digests);
+    let mut guards = Vec::with_capacity(locks.len());
+    #[cfg(test)]
+    let mut first_lock_checkpoint = state.test_hooks.before_blob_lock_attempt();
+    for lock in locks {
+        #[cfg(test)]
+        if let Some(checkpoint) = first_lock_checkpoint.take() {
+            checkpoint.mark_reached();
+        }
+        guards.push(lock.lock_owned().await);
+    }
+    guards
+}
+
+#[derive(Clone)]
+struct BlobPromotion {
+    stored_sha256: String,
+    stored_size_bytes: u64,
+    created: bool,
+}
+
+async fn promote_unique_blobs(
+    state: &AppState,
+    artifacts: &[&PreparedArtifact],
+) -> Result<Vec<BlobPromotion>, ApiError> {
+    let mut promotions = Vec::with_capacity(artifacts.len());
+    for prepared in artifacts {
+        let promotion = promote_blob(
+            &state.storage,
+            &prepared.assembled_path,
+            &prepared.artifact.stored_sha256,
+            prepared.artifact.stored_size_bytes,
+        )
+        .await;
+        let created = match promotion {
+            Ok(created) => created,
+            Err(error) => {
+                let mut cleanup = promotions.clone();
+                cleanup.push(BlobPromotion {
+                    stored_sha256: digest_storage_value(&prepared.artifact.stored_sha256)
+                        .to_owned(),
+                    stored_size_bytes: prepared.artifact.stored_size_bytes,
+                    // A failed promotion may have linked its destination
+                    // before a durability step failed. Conditional cleanup
+                    // checks metadata while the digest locks remain held, so
+                    // it reclaims only an unreferenced file.
+                    created: true,
+                });
+                let _ = cleanup_uncommitted_promotions(state, &cleanup).await;
+                return Err(error);
+            }
+        };
+        promotions.push(BlobPromotion {
+            stored_sha256: digest_storage_value(&prepared.artifact.stored_sha256).to_owned(),
+            stored_size_bytes: prepared.artifact.stored_size_bytes,
+            created,
+        });
+    }
+    Ok(promotions)
+}
+
 async fn find_snapshot_by_fingerprint(
     state: &AppState,
     session_id: &str,
@@ -1170,23 +1597,22 @@ async fn find_snapshot_by_fingerprint(
     Ok(row.map(|row| row.0))
 }
 
-/// Marks `upload_id` completed against an already-committed `snapshot_id`
-/// without touching blobs or artifacts, which already exist for that
-/// snapshot. Tolerates being called more than once for the same outcome
-/// (idempotent retries, or two racing completions that both resolve to the
-/// same winning snapshot).
 async fn finalize_upload_for_existing_snapshot(
     state: &AppState,
     upload_id: &str,
     snapshot_id: &str,
+    transfer_bytes: u64,
 ) -> Result<(), ApiError> {
     let now = now_rfc3339().map_err(|_| ApiError::internal())?;
     let updated = sqlx::query(
-        "UPDATE uploads SET status = 'completed', snapshot_id = ?1, completed_at = ?2
-         WHERE id = ?3 AND status IN ('created', 'artifact_uploaded')",
+        "UPDATE uploads
+         SET status = 'completed', snapshot_id = ?1, completed_at = ?2,
+             transfer_bytes = ?3, newly_persisted_bytes = 0
+         WHERE id = ?4 AND status IN ('created', 'artifact_uploaded')",
     )
     .bind(snapshot_id)
     .bind(&now)
+    .bind(to_sqlite_i64(transfer_bytes)?)
     .bind(upload_id)
     .execute(&state.database)
     .await
@@ -1213,39 +1639,51 @@ async fn finalize_upload_for_existing_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_completed_upload(
     state: &AppState,
     upload_id: &str,
     upload: &ActiveUploadRow,
     manifest: &Manifest,
+    prepared: &[PreparedArtifact],
+    promotions: &[BlobPromotion],
     fingerprint: &str,
-) -> Result<String, ApiError> {
-    // Test-only: lets concurrency tests force a specific winner/loser
-    // ordering between two completions racing on the same session +
-    // fingerprint, by pausing one side here (before it opens its
-    // transaction) while the other runs to completion.
+    transfer_bytes: u64,
+    newly_persisted_bytes: u64,
+) -> Result<(), ApiError> {
     #[cfg(test)]
     if let Some(checkpoint) = state.test_hooks.before_snapshot_commit() {
         checkpoint.arrive_and_wait().await;
     }
+
     let now = now_rfc3339().map_err(|_| ApiError::internal())?;
     let mut transaction = state
         .database
         .begin()
         .await
         .map_err(|error| classify_database_error(&error))?;
-    let (blob_id, blob_freshly_inserted) =
-        get_or_create_blob(&mut transaction, state, &manifest.artifact, &now).await?;
+    let mut blob_ids = HashMap::new();
+    for prepared_artifact in prepared {
+        let digest = digest_storage_value(&prepared_artifact.artifact.stored_sha256).to_owned();
+        if let std::collections::hash_map::Entry::Vacant(entry) = blob_ids.entry(digest) {
+            let blob_id =
+                get_or_create_blob(&mut transaction, state, &prepared_artifact.artifact, &now)
+                    .await?;
+            entry.insert(blob_id);
+        }
+    }
     let manifest_id: (String,) = sqlx::query_as("SELECT id FROM manifests WHERE upload_id = ?1")
         .bind(upload_id)
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| ApiError::database())?;
+    let (total_original_bytes, total_stored_bytes) = manifest_totals(manifest)?;
     let candidate_snapshot_id = Uuid::now_v7().to_string();
     let snapshot_insert = sqlx::query(
         "INSERT INTO snapshots (
-            id, owner_namespace, session_id, manifest_id, fingerprint_sha256, completed_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            id, owner_namespace, session_id, manifest_id, fingerprint_sha256, completed_at,
+            artifact_count, total_original_size_bytes, total_stored_size_bytes
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(session_id, fingerprint_sha256) DO NOTHING",
     )
     .bind(&candidate_snapshot_id)
@@ -1254,129 +1692,123 @@ async fn record_completed_upload(
     .bind(&manifest_id.0)
     .bind(fingerprint)
     .bind(&now)
+    .bind(to_sqlite_i64(
+        u64::try_from(prepared.len()).map_err(|_| ApiError::internal())?,
+    )?)
+    .bind(to_sqlite_i64(total_original_bytes)?)
+    .bind(to_sqlite_i64(total_stored_bytes)?)
     .execute(&mut *transaction)
     .await
     .map_err(|_| ApiError::database())?;
 
     if snapshot_insert.rows_affected() == 0 {
-        return resolve_losing_snapshot_race(
-            state,
-            upload_id,
-            upload,
-            manifest,
-            fingerprint,
-            transaction,
-            blob_freshly_inserted,
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| classify_database_error(&error))?;
+        #[cfg(test)]
+        if let Some(checkpoint) = state.test_hooks.after_losing_rollback() {
+            checkpoint.arrive_and_wait().await;
+        }
+        let winner: (String,) = sqlx::query_as(
+            "SELECT id FROM snapshots WHERE session_id = ?1 AND fingerprint_sha256 = ?2",
         )
-        .await;
+        .bind(&upload.session_id)
+        .bind(fingerprint)
+        .fetch_one(&state.database)
+        .await
+        .map_err(|_| ApiError::database())?;
+        cleanup_uncommitted_promotions(state, promotions).await?;
+        finalize_upload_for_existing_snapshot(state, upload_id, &winner.0, transfer_bytes).await?;
+        return Ok(());
     }
 
     finalize_winning_snapshot(
         &mut transaction,
         upload_id,
         &candidate_snapshot_id,
-        &blob_id,
-        manifest,
+        prepared,
+        &blob_ids,
         &now,
+        transfer_bytes,
+        newly_persisted_bytes,
     )
     .await?;
     transaction
         .commit()
         .await
         .map_err(|error| classify_database_error(&error))?;
-    Ok(candidate_snapshot_id)
+    Ok(())
 }
 
-/// Handles the losing side of a snapshot creation race: a different upload
-/// racing on the same session/fingerprint committed a snapshot first. Rolls
-/// back before any of our work becomes visible, discarding the blob row we
-/// may have just inserted, and cleans up the file we had promoted if it is
-/// now guaranteed unreferenced. No restart is required to reclaim it.
-///
-/// The caller must hold `state.blob_lock` for this artifact's
-/// `(owner_namespace, stored_sha256)` for the entire call. Without it, a
-/// third party could commit a fresh blob/artifact reference to the same
-/// digest in the gap between the rollback below (which releases the
-/// `SQLite` write lock) and the conditional file deletion, leaving that
-/// party's reference dangling once this task deletes the file.
-async fn resolve_losing_snapshot_race(
+async fn cleanup_uncommitted_promotions(
     state: &AppState,
-    upload_id: &str,
-    upload: &ActiveUploadRow,
-    manifest: &Manifest,
-    fingerprint: &str,
-    transaction: sqlx::Transaction<'_, sqlx::Sqlite>,
-    blob_freshly_inserted: bool,
-) -> Result<String, ApiError> {
-    transaction
-        .rollback()
-        .await
-        .map_err(|error| classify_database_error(&error))?;
-    // Test-only: lets concurrency tests deterministically land a third
-    // party's completion inside this exact historical vulnerable window
-    // (see the doc comment above) instead of relying on scheduling luck.
-    // The blob lock held by our caller makes this a no-op race in
-    // production: nothing else touching this digest can run concurrently.
-    #[cfg(test)]
-    if let Some(checkpoint) = state.test_hooks.after_losing_rollback() {
-        checkpoint.arrive_and_wait().await;
+    promotions: &[BlobPromotion],
+) -> Result<(), ApiError> {
+    for promotion in promotions.iter().filter(|promotion| promotion.created) {
+        let referenced: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM blobs WHERE owner_namespace = ?1 AND stored_sha256 = ?2")
+                .bind(&state.identity.owner_namespace)
+                .bind(&promotion.stored_sha256)
+                .fetch_optional(&state.database)
+                .await
+                .map_err(|_| ApiError::database())?;
+        if referenced.is_none() {
+            StorageLayout::remove_file(&state.storage.blob_path(&promotion.stored_sha256))
+                .await
+                .map_err(|_| ApiError::storage())?;
+        }
     }
-    let winner: (String,) = sqlx::query_as(
-        "SELECT id FROM snapshots WHERE session_id = ?1 AND fingerprint_sha256 = ?2",
-    )
-    .bind(&upload.session_id)
-    .bind(fingerprint)
-    .fetch_one(&state.database)
-    .await
-    .map_err(|_| ApiError::database())?;
-    if blob_freshly_inserted {
-        // Our blob row was rolled back, so the file we had just promoted is
-        // guaranteed unreferenced by any committed row.
-        let _ = StorageLayout::remove_file(
-            &state
-                .storage
-                .blob_path(digest_storage_value(&manifest.artifact.stored_sha256)),
-        )
-        .await;
-    }
-    finalize_upload_for_existing_snapshot(state, upload_id, &winner.0).await?;
-    Ok(winner.0)
+    Ok(())
 }
 
-/// Links the winning snapshot to its artifact and marks the upload
-/// completed, all within the caller's still-open transaction.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_winning_snapshot(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     upload_id: &str,
     snapshot_id: &str,
-    blob_id: &str,
-    manifest: &Manifest,
+    prepared: &[PreparedArtifact],
+    blob_ids: &HashMap<String, String>,
     now: &str,
+    transfer_bytes: u64,
+    newly_persisted_bytes: u64,
 ) -> Result<(), ApiError> {
-    sqlx::query(
-        "INSERT INTO artifacts (
-            id, snapshot_id, blob_id, logical_path, media_type, original_size_bytes,
-            original_sha256, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )
-    .bind(Uuid::now_v7().to_string())
-    .bind(snapshot_id)
-    .bind(blob_id)
-    .bind(&manifest.artifact.logical_path)
-    .bind(&manifest.artifact.media_type)
-    .bind(to_sqlite_i64(manifest.artifact.original_size_bytes)?)
-    .bind(digest_storage_value(&manifest.artifact.original_sha256))
-    .bind(now)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|_| ApiError::database())?;
-
+    for prepared_artifact in prepared {
+        let digest = digest_storage_value(&prepared_artifact.artifact.stored_sha256);
+        let blob_id = blob_ids.get(digest).ok_or_else(ApiError::internal)?;
+        sqlx::query(
+            "INSERT INTO artifacts (
+                id, snapshot_id, blob_id, logical_path, media_type, original_size_bytes,
+                original_sha256, created_at, artifact_index
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(snapshot_id)
+        .bind(blob_id)
+        .bind(&prepared_artifact.artifact.logical_path)
+        .bind(&prepared_artifact.artifact.media_type)
+        .bind(to_sqlite_i64(
+            prepared_artifact.artifact.original_size_bytes,
+        )?)
+        .bind(digest_storage_value(
+            &prepared_artifact.artifact.original_sha256,
+        ))
+        .bind(now)
+        .bind(i64::from(prepared_artifact.artifact_index))
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| ApiError::database())?;
+    }
     let updated = sqlx::query(
-        "UPDATE uploads SET status = 'completed', snapshot_id = ?1, completed_at = ?2
-         WHERE id = ?3 AND status IN ('created', 'artifact_uploaded')",
+        "UPDATE uploads
+         SET status = 'completed', snapshot_id = ?1, completed_at = ?2,
+             transfer_bytes = ?3, newly_persisted_bytes = ?4
+         WHERE id = ?5 AND status IN ('created', 'artifact_uploaded')",
     )
     .bind(snapshot_id)
     .bind(now)
+    .bind(to_sqlite_i64(transfer_bytes)?)
+    .bind(to_sqlite_i64(newly_persisted_bytes)?)
     .bind(upload_id)
     .execute(&mut **transaction)
     .await
@@ -1403,26 +1835,14 @@ async fn finalize_winning_snapshot(
     }
 }
 
-/// Inserts a blob row for `artifact`'s stored bytes if one does not already
-/// exist, returning its ID and whether this call is the one that created it.
-/// The `bool` lets a caller that later loses a snapshot race and rolls back
-/// know whether the file it promoted is safe to delete: a freshly-inserted
-/// row never became visible outside this transaction, so after a rollback no
-/// *committed* blob row references the underlying file. That alone is not
-/// enough to delete the file safely, because the file path is addressed by
-/// digest rather than by this row's ID: a different transaction could insert
-/// a new row for the same digest and promote/reuse the same path before the
-/// caller deletes it. Callers must hold `state.blob_lock` for this digest
-/// across the insert, the eventual commit or rollback, and any conditional
-/// deletion so no such transaction can run concurrently.
 async fn get_or_create_blob(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     state: &AppState,
     artifact: &Artifact,
     now: &str,
-) -> Result<(String, bool), ApiError> {
+) -> Result<String, ApiError> {
     let blob_id = Uuid::now_v7().to_string();
-    let insert = sqlx::query(
+    sqlx::query(
         "INSERT INTO blobs (
             id, owner_namespace, stored_sha256, stored_size_bytes, compression, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1437,7 +1857,6 @@ async fn get_or_create_blob(
     .execute(&mut **transaction)
     .await
     .map_err(|_| ApiError::database())?;
-    let freshly_inserted = insert.rows_affected() == 1;
     let row = sqlx::query_as::<_, BlobRow>(
         "SELECT id, stored_size_bytes, compression FROM blobs
          WHERE owner_namespace = ?1 AND stored_sha256 = ?2",
@@ -1455,7 +1874,7 @@ async fn get_or_create_blob(
             "stored bytes are already associated with a different representation",
         ));
     }
-    Ok((row.id, freshly_inserted))
+    Ok(row.id)
 }
 
 fn compression_name(compression: Compression) -> &'static str {
@@ -1523,6 +1942,13 @@ async fn verify_artifact(path: &Path, artifact: &Artifact) -> Result<(), ApiErro
 }
 
 fn verify_artifact_blocking(path: &Path, artifact: &Artifact) -> Result<(), ApiError> {
+    if !std::fs::symlink_metadata(path)
+        .map_err(|_| ApiError::storage())?
+        .file_type()
+        .is_file()
+    {
+        return Err(ApiError::storage());
+    }
     let mut file = std::fs::File::open(path).map_err(|_| ApiError::storage())?;
     let (stored_size, stored_digest) =
         hash_reader(&mut file, artifact.stored_size_bytes, ApiError::storage)?;
@@ -1598,6 +2024,13 @@ async fn verify_stored_file(
 ) -> Result<(), ApiError> {
     let expected_digest = expected_digest.to_owned();
     tokio::task::spawn_blocking(move || {
+        if !std::fs::symlink_metadata(&path)
+            .map_err(|_| ApiError::storage())?
+            .file_type()
+            .is_file()
+        {
+            return Err(ApiError::storage());
+        }
         let mut file = std::fs::File::open(path).map_err(|_| ApiError::storage())?;
         let (size, digest) = hash_reader(&mut file, expected_size, ApiError::storage)?;
         if size == expected_size && digest == digest_storage_value(&expected_digest) {
@@ -1615,24 +2048,52 @@ async fn promote_blob(
     source_path: &Path,
     stored_sha256: &str,
     stored_size: u64,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let destination = storage.blob_path(digest_storage_value(stored_sha256));
     let parent = destination.parent().ok_or_else(ApiError::storage)?;
     fs::create_dir_all(parent)
         .await
         .map_err(|_| ApiError::storage())?;
     match fs::hard_link(source_path, &destination).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            sync_parent_directory(&destination).await?;
+            Ok(true)
+        }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            verify_stored_file(destination, stored_size, stored_sha256).await
+            verify_stored_file(destination, stored_size, stored_sha256).await?;
+            Ok(false)
         }
         Err(_) => Err(ApiError::storage()),
     }
 }
 
+async fn sync_parent_directory(path: &Path) -> Result<(), ApiError> {
+    let parent = path.parent().ok_or_else(ApiError::storage)?.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| ApiError::storage())
+    })
+    .await
+    .map_err(|_| ApiError::internal())?
+}
+
+async fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 fn snapshot_fingerprint(manifest: &Manifest) -> Result<String, ApiError> {
     #[derive(Serialize)]
     struct Fingerprint<'a> {
+        schema_version: u16,
+        session: &'a SessionInput,
+        capture: StableCapture<'a>,
+        artifacts: Vec<OriginalArtifact<'a>>,
+    }
+    #[derive(Serialize)]
+    struct LegacySingletonFingerprint<'a> {
         schema_version: u16,
         session: &'a SessionInput,
         capture: StableCapture<'a>,
@@ -1652,20 +2113,45 @@ fn snapshot_fingerprint(manifest: &Manifest) -> Result<String, ApiError> {
         original_sha256: &'a str,
     }
 
+    let capture = StableCapture {
+        project: &manifest.capture.project,
+        repository: &manifest.capture.repository,
+        branch: &manifest.capture.branch,
+        source_agent_version: &manifest.capture.source_agent_version,
+    };
+    if let [artifact] = manifest.artifacts.as_slice() {
+        // v2/v3 databases used this singleton fingerprint document. Retaining
+        // it for a one-artifact canonical v1 manifest lets a migrated archive
+        // continue to semantically deduplicate its historical snapshots.
+        let fingerprint = LegacySingletonFingerprint {
+            schema_version: manifest.schema_version,
+            session: &manifest.session,
+            capture,
+            artifact: OriginalArtifact {
+                logical_path: &artifact.logical_path,
+                original_size_bytes: artifact.original_size_bytes,
+                original_sha256: &artifact.original_sha256,
+            },
+        };
+        return serde_json::to_vec(&fingerprint)
+            .map(|value| sha256_hex(&value))
+            .map_err(|_| ApiError::internal());
+    }
+    let mut artifacts = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| OriginalArtifact {
+            logical_path: &artifact.logical_path,
+            original_size_bytes: artifact.original_size_bytes,
+            original_sha256: &artifact.original_sha256,
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_unstable_by(|left, right| left.logical_path.cmp(right.logical_path));
     let fingerprint = Fingerprint {
         schema_version: manifest.schema_version,
         session: &manifest.session,
-        capture: StableCapture {
-            project: &manifest.capture.project,
-            repository: &manifest.capture.repository,
-            branch: &manifest.capture.branch,
-            source_agent_version: &manifest.capture.source_agent_version,
-        },
-        artifact: OriginalArtifact {
-            logical_path: &manifest.artifact.logical_path,
-            original_size_bytes: manifest.artifact.original_size_bytes,
-            original_sha256: &manifest.artifact.original_sha256,
-        },
+        capture,
+        artifacts,
     };
     serde_json::to_vec(&fingerprint)
         .map(|value| sha256_hex(&value))
@@ -1698,6 +2184,9 @@ pub(crate) async fn download_artifact(
     .map_err(|_| ApiError::database())?
     .ok_or_else(|| ApiError::not_found("artifact_not_found", "artifact was not found"))?;
     let path = state.storage.blob_path(&row.stored_sha256);
+    if !is_regular_file(&path).await {
+        return Err(ApiError::storage());
+    }
     let file = fs::File::open(path)
         .await
         .map_err(|_| ApiError::storage())?;
@@ -1729,17 +2218,18 @@ async fn get_upload_manifest(database: &SqlitePool, upload_id: &str) -> Result<M
     serde_json::from_str(&row.0).map_err(|_| ApiError::internal())
 }
 
-async fn receipt_for_snapshot(state: &AppState, snapshot_id: &str) -> Result<Receipt, ApiError> {
+async fn receipt_for_upload(state: &AppState, upload_id: &str) -> Result<Receipt, ApiError> {
     let row = sqlx::query_as::<_, ReceiptRow>(
-        "SELECT s.id, s.session_id, s.fingerprint_sha256, s.completed_at, m.sha256 AS manifest_sha256,
-                a.original_size_bytes, b.stored_size_bytes
-         FROM snapshots s
+        "SELECT s.id, s.session_id, s.fingerprint_sha256, s.completed_at,
+                m.sha256 AS manifest_sha256, s.artifact_count,
+                s.total_original_size_bytes, s.total_stored_size_bytes,
+                u.transfer_bytes, u.newly_persisted_bytes
+         FROM uploads u
+         JOIN snapshots s ON s.id = u.snapshot_id
          JOIN manifests m ON m.id = s.manifest_id
-         JOIN artifacts a ON a.snapshot_id = s.id
-         JOIN blobs b ON b.id = a.blob_id
-         WHERE s.id = ?1",
+         WHERE u.id = ?1 AND u.status = 'completed'",
     )
-    .bind(snapshot_id)
+    .bind(upload_id)
     .fetch_optional(&state.database)
     .await
     .map_err(|_| ApiError::database())?
@@ -1752,10 +2242,14 @@ async fn receipt_for_snapshot(state: &AppState, snapshot_id: &str) -> Result<Rec
         session_id: row.session_id,
         snapshot_fingerprint: digest_document_value(&row.fingerprint_sha256),
         manifest_sha256: digest_document_value(&row.manifest_sha256),
-        artifact_count: 1,
-        total_original_bytes: u64::try_from(row.original_size_bytes)
+        artifact_count: u32::try_from(row.artifact_count).map_err(|_| ApiError::internal())?,
+        total_original_bytes: u64::try_from(row.total_original_size_bytes)
             .map_err(|_| ApiError::internal())?,
-        total_stored_bytes: u64::try_from(row.stored_size_bytes)
+        total_stored_bytes: u64::try_from(row.total_stored_size_bytes)
+            .map_err(|_| ApiError::internal())?,
+        upload_transfer_bytes: u64::try_from(row.transfer_bytes)
+            .map_err(|_| ApiError::internal())?,
+        newly_persisted_physical_bytes: u64::try_from(row.newly_persisted_bytes)
             .map_err(|_| ApiError::internal())?,
         completed_at: row.completed_at,
     })
@@ -1766,8 +2260,9 @@ async fn snapshot_response(
     snapshot_id: &str,
 ) -> Result<SnapshotResponse, ApiError> {
     let row = sqlx::query_as::<_, SnapshotRow>(
-        "SELECT s.id, s.session_id, s.fingerprint_sha256, s.completed_at, m.sha256 AS manifest_sha256,
-                m.canonical_json
+        "SELECT s.id, s.session_id, s.fingerprint_sha256, s.completed_at,
+                s.artifact_count, s.total_original_size_bytes, s.total_stored_size_bytes,
+                m.sha256 AS manifest_sha256, m.canonical_json
          FROM snapshots s JOIN manifests m ON m.id = s.manifest_id
          WHERE s.id = ?1",
     )
@@ -1776,13 +2271,16 @@ async fn snapshot_response(
     .await
     .map_err(|_| ApiError::database())?
     .ok_or_else(|| ApiError::not_found("snapshot_not_found", "snapshot was not found"))?;
+    reconcile_snapshot(database, snapshot_id)
+        .await
+        .map_err(|_| ApiError::internal())?;
     let manifest: Manifest =
         serde_json::from_str(&row.canonical_json).map_err(|_| ApiError::internal())?;
     let artifacts = sqlx::query_as::<_, ArtifactRow>(
-        "SELECT a.id, a.logical_path, a.media_type, a.original_size_bytes, a.original_sha256,
+        "SELECT a.id, a.artifact_index, a.logical_path, a.media_type, a.original_size_bytes, a.original_sha256,
                 b.stored_size_bytes, b.stored_sha256, b.compression
          FROM artifacts a JOIN blobs b ON b.id = a.blob_id WHERE a.snapshot_id = ?1
-         ORDER BY a.logical_path",
+         ORDER BY a.artifact_index",
     )
     .bind(snapshot_id)
     .fetch_all(database)
@@ -1797,6 +2295,11 @@ async fn snapshot_response(
         snapshot_fingerprint: digest_document_value(&row.fingerprint_sha256),
         manifest_sha256: digest_document_value(&row.manifest_sha256),
         completed_at: row.completed_at,
+        artifact_count: u32::try_from(row.artifact_count).map_err(|_| ApiError::internal())?,
+        total_original_bytes: u64::try_from(row.total_original_size_bytes)
+            .map_err(|_| ApiError::internal())?,
+        total_stored_bytes: u64::try_from(row.total_stored_size_bytes)
+            .map_err(|_| ApiError::internal())?,
         manifest,
         artifacts,
     })
@@ -1806,6 +2309,7 @@ fn artifact_response(row: ArtifactRow) -> Result<ArtifactResponse, ApiError> {
     Ok(ArtifactResponse {
         content_url: format!("/api/v1/artifacts/{}/content", row.id),
         artifact_id: row.id,
+        artifact_index: u32::try_from(row.artifact_index).map_err(|_| ApiError::internal())?,
         logical_path: row.logical_path,
         media_type: row.media_type,
         original_size_bytes: u64::try_from(row.original_size_bytes)
@@ -1814,11 +2318,7 @@ fn artifact_response(row: ArtifactRow) -> Result<ArtifactResponse, ApiError> {
         stored_size_bytes: u64::try_from(row.stored_size_bytes)
             .map_err(|_| ApiError::internal())?,
         stored_sha256: digest_document_value(&row.stored_sha256),
-        compression: match row.compression.as_str() {
-            "identity" => Compression::Identity,
-            "zstd" => Compression::Zstd,
-            _ => return Err(ApiError::internal()),
-        },
+        compression: parse_compression(&row.compression).map_err(|()| ApiError::internal())?,
     })
 }
 
@@ -1843,8 +2343,12 @@ fn chunk_count(stored_size: u64, chunk_size: u64) -> Result<u64, ApiError> {
     Ok(count)
 }
 
-fn expected_chunk_length(upload: &ActiveUploadRow, chunk_index: u64) -> Result<u64, ApiError> {
-    let chunk_count = u64::try_from(upload.chunk_count).map_err(|_| ApiError::internal())?;
+fn expected_chunk_length(
+    upload: &ActiveUploadRow,
+    artifact: &UploadArtifactRow,
+    chunk_index: u64,
+) -> Result<u64, ApiError> {
+    let chunk_count = u64::try_from(artifact.chunk_count).map_err(|_| ApiError::internal())?;
     if chunk_index >= chunk_count {
         return Err(ApiError::invalid(
             "chunk index is outside the negotiated artifact range",
@@ -1852,7 +2356,7 @@ fn expected_chunk_length(upload: &ActiveUploadRow, chunk_index: u64) -> Result<u
     }
     let chunk_size = u64::try_from(upload.chunk_size_bytes).map_err(|_| ApiError::internal())?;
     let stored_size =
-        u64::try_from(upload.declared_stored_size_bytes).map_err(|_| ApiError::internal())?;
+        u64::try_from(artifact.stored_size_bytes).map_err(|_| ApiError::internal())?;
     let offset = chunk_index
         .checked_mul(chunk_size)
         .ok_or_else(ApiError::internal)?;
@@ -1863,6 +2367,12 @@ fn expected_chunk_length(upload: &ActiveUploadRow, chunk_index: u64) -> Result<u
     } else {
         Ok(chunk_size)
     }
+}
+
+fn parse_artifact_index(value: &str) -> Result<u32, ApiError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| ApiError::invalid("artifact index is not a non-negative integer"))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1889,14 +2399,23 @@ fn digest_document_value(value: &str) -> String {
     format!("sha256:{}", digest_storage_value(value))
 }
 
+fn parse_compression(value: &str) -> Result<Compression, ()> {
+    match value {
+        "identity" => Ok(Compression::Identity),
+        "zstd" => Ok(Compression::Zstd),
+        _ => Err(()),
+    }
+}
+
 async fn get_active_upload(
     database: &SqlitePool,
     upload_id: &str,
 ) -> Result<Option<ActiveUploadRow>, ApiError> {
     sqlx::query_as(
-        "SELECT id, owner_namespace, session_id, client_id, manifest_sha256, status, snapshot_id,
+        "SELECT id, owner_namespace, session_id, client_id, manifest_sha256, status,
                 created_at, chunk_size_bytes, chunk_count, declared_stored_size_bytes,
-                declared_original_size_bytes, expires_at
+                declared_original_size_bytes, expires_at, artifact_count,
+                total_stored_size_bytes, total_original_size_bytes
          FROM uploads WHERE id = ?1",
     )
     .bind(upload_id)
@@ -1905,16 +2424,50 @@ async fn get_active_upload(
     .map_err(|_| ApiError::database())
 }
 
+async fn get_upload_artifacts(
+    database: &SqlitePool,
+    upload_id: &str,
+) -> Result<Vec<UploadArtifactRow>, ApiError> {
+    sqlx::query_as(
+        "SELECT artifact_index, logical_path, media_type, original_size_bytes, original_sha256,
+                stored_size_bytes, stored_sha256, compression, chunk_count
+         FROM upload_artifacts WHERE upload_id = ?1 ORDER BY artifact_index",
+    )
+    .bind(upload_id)
+    .fetch_all(database)
+    .await
+    .map_err(|_| ApiError::database())
+}
+
+async fn get_upload_artifact(
+    database: &SqlitePool,
+    upload_id: &str,
+    artifact_index: u32,
+) -> Result<Option<UploadArtifactRow>, ApiError> {
+    sqlx::query_as(
+        "SELECT artifact_index, logical_path, media_type, original_size_bytes, original_sha256,
+                stored_size_bytes, stored_sha256, compression, chunk_count
+         FROM upload_artifacts WHERE upload_id = ?1 AND artifact_index = ?2",
+    )
+    .bind(upload_id)
+    .bind(i64::from(artifact_index))
+    .fetch_optional(database)
+    .await
+    .map_err(|_| ApiError::database())
+}
+
 async fn get_chunk(
     database: &SqlitePool,
     upload_id: &str,
+    artifact_index: u32,
     chunk_index: u64,
 ) -> Result<Option<ChunkRow>, ApiError> {
     sqlx::query_as(
         "SELECT chunk_index, byte_length, sha256 FROM upload_chunks
-         WHERE upload_id = ?1 AND artifact_index = 0 AND chunk_index = ?2",
+         WHERE upload_id = ?1 AND artifact_index = ?2 AND chunk_index = ?3",
     )
     .bind(upload_id)
+    .bind(i64::from(artifact_index))
     .bind(to_sqlite_i64(chunk_index)?)
     .fetch_optional(database)
     .await
@@ -1945,13 +2498,28 @@ struct ActiveUploadRow {
     client_id: String,
     manifest_sha256: String,
     status: String,
-    snapshot_id: Option<String>,
     created_at: String,
     chunk_size_bytes: i64,
     chunk_count: i64,
     declared_stored_size_bytes: i64,
     declared_original_size_bytes: i64,
     expires_at: String,
+    artifact_count: i64,
+    total_stored_size_bytes: i64,
+    total_original_size_bytes: i64,
+}
+
+#[derive(Clone, FromRow)]
+struct UploadArtifactRow {
+    artifact_index: i64,
+    logical_path: String,
+    media_type: Option<String>,
+    original_size_bytes: i64,
+    original_sha256: String,
+    stored_size_bytes: i64,
+    stored_sha256: String,
+    compression: String,
+    chunk_count: i64,
 }
 
 #[derive(FromRow)]
@@ -1989,8 +2557,11 @@ struct ReceiptRow {
     fingerprint_sha256: String,
     manifest_sha256: String,
     completed_at: String,
-    original_size_bytes: i64,
-    stored_size_bytes: i64,
+    artifact_count: i64,
+    total_original_size_bytes: i64,
+    total_stored_size_bytes: i64,
+    transfer_bytes: i64,
+    newly_persisted_bytes: i64,
 }
 
 #[derive(FromRow)]
@@ -2000,12 +2571,16 @@ struct SnapshotRow {
     fingerprint_sha256: String,
     manifest_sha256: String,
     completed_at: String,
+    artifact_count: i64,
+    total_original_size_bytes: i64,
+    total_stored_size_bytes: i64,
     canonical_json: String,
 }
 
 #[derive(FromRow)]
 struct ArtifactRow {
     id: String,
+    artifact_index: i64,
     logical_path: String,
     media_type: Option<String>,
     original_size_bytes: i64,
@@ -2021,20 +2596,16 @@ struct DownloadRow {
     stored_size_bytes: i64,
 }
 
-/// Reconciles file-first chunk persistence after a restart.
-///
-/// A durable chunk file is linked and synced before its record is committed.
-/// Therefore orphan files can be discarded safely; accepted records without a
-/// file are removed so a client can retry the affected chunk. Completed and
-/// terminal upload directories are always disposable after their metadata state
-/// has committed.
+/// Reconciles file-first upload persistence after a restart. New multi-artifact
+/// projection rows are installed before status recovery, then each artifact's
+/// accepted chunks are checked independently.
 pub(crate) async fn recover_uploads(state: &AppState) -> Result<(), MaintenanceError> {
+    upgrade_upload_artifact_rows(state).await?;
     upgrade_legacy_uploads(state).await?;
-    let uploads =
-        sqlx::query_as::<_, RecoveryUploadRow>("SELECT id, status, chunk_count FROM uploads")
-            .fetch_all(&state.database)
-            .await
-            .map_err(|_| MaintenanceError::Operation)?;
+    let uploads = sqlx::query_as::<_, RecoveryUploadRow>("SELECT id, status FROM uploads")
+        .fetch_all(&state.database)
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
     let audits = sqlx::query_as::<_, (String,)>("SELECT upload_id FROM upload_audits")
         .fetch_all(&state.database)
         .await
@@ -2069,9 +2640,101 @@ pub(crate) async fn recover_uploads(state: &AppState) -> Result<(), MaintenanceE
     Ok(())
 }
 
-/// Migrates the pre-chunk v1 temporary `artifact` file when a volume created by
-/// the previous server is first opened. The migration keeps the old file until
-/// its new chunk record commits, so either crash ordering is retryable.
+#[derive(FromRow)]
+struct UpgradeUploadRow {
+    id: String,
+    canonical_json: String,
+    chunk_size_bytes: i64,
+    chunk_count: i64,
+}
+
+async fn upgrade_upload_artifact_rows(state: &AppState) -> Result<(), MaintenanceError> {
+    let rows = sqlx::query_as::<_, UpgradeUploadRow>(
+        "SELECT u.id, m.canonical_json, u.chunk_size_bytes, u.chunk_count
+         FROM uploads u JOIN manifests m ON m.upload_id = u.id
+         WHERE NOT EXISTS (
+             SELECT 1 FROM upload_artifacts ua WHERE ua.upload_id = u.id
+         )",
+    )
+    .fetch_all(&state.database)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+    for row in rows {
+        let manifest: Manifest =
+            serde_json::from_str(&row.canonical_json).map_err(|_| MaintenanceError::Operation)?;
+        if manifest.artifacts.is_empty() {
+            return Err(MaintenanceError::Operation);
+        }
+        let chunk_size =
+            u64::try_from(row.chunk_size_bytes).map_err(|_| MaintenanceError::Operation)?;
+        let layout =
+            upload_layout(&manifest, chunk_size).map_err(|_| MaintenanceError::Operation)?;
+        let mut transaction = state
+            .database
+            .begin()
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+        for (index, (artifact, computed_count)) in manifest
+            .artifacts
+            .iter()
+            .zip(&layout.chunk_counts)
+            .enumerate()
+        {
+            let count = if manifest.artifacts.len() == 1 && row.chunk_count > 0 {
+                u64::try_from(row.chunk_count).map_err(|_| MaintenanceError::Operation)?
+            } else {
+                *computed_count
+            };
+            insert_upload_artifact(
+                &mut transaction,
+                &row.id,
+                u32::try_from(index).map_err(|_| MaintenanceError::Operation)?,
+                artifact,
+                count,
+            )
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+        }
+        let first = manifest
+            .artifacts
+            .first()
+            .ok_or(MaintenanceError::Operation)?;
+        let first_count = if row.chunk_count > 0 {
+            row.chunk_count
+        } else {
+            i64::try_from(layout.chunk_counts[0]).map_err(|_| MaintenanceError::Operation)?
+        };
+        sqlx::query(
+            "UPDATE uploads
+             SET artifact_count = ?1, total_original_size_bytes = ?2,
+                 total_stored_size_bytes = ?3, declared_original_size_bytes = ?4,
+                 declared_stored_size_bytes = ?5, chunk_count = ?6,
+                 transfer_bytes = CASE
+                     WHEN status = 'completed' THEN ?3 ELSE transfer_bytes
+                 END
+             WHERE id = ?7",
+        )
+        .bind(i64::try_from(manifest.artifacts.len()).map_err(|_| MaintenanceError::Operation)?)
+        .bind(i64::try_from(layout.total_original_bytes).map_err(|_| MaintenanceError::Operation)?)
+        .bind(i64::try_from(layout.total_stored_bytes).map_err(|_| MaintenanceError::Operation)?)
+        .bind(i64::try_from(first.original_size_bytes).map_err(|_| MaintenanceError::Operation)?)
+        .bind(i64::try_from(first.stored_size_bytes).map_err(|_| MaintenanceError::Operation)?)
+        .bind(first_count)
+        .bind(&row.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+    }
+    Ok(())
+}
+
+/// Moves the v2 single temporary artifact into the v3+ artifact-zero chunk
+/// layout. The old source is retained until the metadata transaction commits,
+/// so either crash ordering remains recoverable.
 async fn upgrade_legacy_uploads(state: &AppState) -> Result<(), MaintenanceError> {
     let legacy = sqlx::query_as::<_, LegacyUploadRow>(
         "SELECT u.id, m.canonical_json
@@ -2095,95 +2758,33 @@ async fn upgrade_legacy_uploads(state: &AppState) -> Result<(), MaintenanceError
     Ok(())
 }
 
+#[derive(FromRow)]
+struct LegacyUploadRow {
+    id: String,
+    canonical_json: String,
+}
+
 async fn upgrade_legacy_upload(
     state: &AppState,
     upload: LegacyUploadRow,
     now: &str,
     expires_at: &str,
 ) -> Result<(), MaintenanceError> {
-    let Ok(manifest) = serde_json::from_str::<Manifest>(&upload.canonical_json) else {
-        return Ok(());
-    };
-    let stored_size = manifest.artifact.stored_size_bytes;
+    let manifest: Manifest =
+        serde_json::from_str(&upload.canonical_json).map_err(|_| MaintenanceError::Operation)?;
+    if manifest.artifacts.len() != 1 {
+        return Err(MaintenanceError::Operation);
+    }
+    let artifact = &manifest.artifacts[0];
+    let stored_size = artifact.stored_size_bytes;
     let chunk_size = if stored_size == 0 {
         state.chunk_size_bytes
     } else {
         stored_size
     };
     let source = state.storage.upload_dir(&upload.id).join("artifact");
-    let accepted = migrate_legacy_file(state, &upload.id, &manifest, &source).await?;
-    let layout = LegacyLayout {
-        upload_id: &upload.id,
-        manifest: &manifest,
-        chunk_size,
-        accepted,
-        now,
-        expires_at,
-    };
-    persist_legacy_layout(state, &layout).await?;
-    if accepted {
-        StorageLayout::remove_file(&source)
-            .await
-            .map_err(|_| MaintenanceError::Operation)?;
-    }
-    Ok(())
-}
-
-async fn migrate_legacy_file(
-    state: &AppState,
-    upload_id: &str,
-    manifest: &Manifest,
-    source: &Path,
-) -> Result<bool, MaintenanceError> {
-    let stored_size = manifest.artifact.stored_size_bytes;
-    if stored_size == 0
-        || !fs::try_exists(source)
-            .await
-            .map_err(|_| MaintenanceError::Operation)?
-        || verify_stored_file(
-            source.to_path_buf(),
-            stored_size,
-            &manifest.artifact.stored_sha256,
-        )
-        .await
-        .is_err()
-    {
-        return Ok(false);
-    }
-    state
-        .storage
-        .ensure_chunk_dir(upload_id)
-        .await
-        .map_err(|_| MaintenanceError::Operation)?;
-    let destination = state.storage.chunk_path(upload_id, 0);
-    match fs::hard_link(source, &destination).await {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            Ok(
-                verify_stored_file(destination, stored_size, &manifest.artifact.stored_sha256)
-                    .await
-                    .is_ok(),
-            )
-        }
-        Err(_) => Err(MaintenanceError::Operation),
-    }
-}
-
-struct LegacyLayout<'a> {
-    upload_id: &'a str,
-    manifest: &'a Manifest,
-    chunk_size: u64,
-    accepted: bool,
-    now: &'a str,
-    expires_at: &'a str,
-}
-
-async fn persist_legacy_layout(
-    state: &AppState,
-    layout: &LegacyLayout<'_>,
-) -> Result<(), MaintenanceError> {
-    let stored_size = layout.manifest.artifact.stored_size_bytes;
-    let status = if stored_size == 0 || layout.accepted {
+    let accepted = migrate_legacy_file(state, &upload.id, artifact, &source).await?;
+    let status = if stored_size == 0 || accepted {
         "artifact_uploaded"
     } else {
         "created"
@@ -2196,35 +2797,41 @@ async fn persist_legacy_layout(
     sqlx::query(
         "UPDATE uploads SET
             chunk_size_bytes = ?1, chunk_count = ?2, declared_stored_size_bytes = ?3,
-            declared_original_size_bytes = ?4, expires_at = ?5, status = ?6
+            declared_original_size_bytes = ?4, expires_at = ?5, status = ?6,
+            artifact_count = 1, total_stored_size_bytes = ?3,
+            total_original_size_bytes = ?4
          WHERE id = ?7",
     )
-    .bind(i64::try_from(layout.chunk_size).map_err(|_| MaintenanceError::Operation)?)
+    .bind(i64::try_from(chunk_size).map_err(|_| MaintenanceError::Operation)?)
     .bind(i64::from(stored_size != 0))
     .bind(i64::try_from(stored_size).map_err(|_| MaintenanceError::Operation)?)
-    .bind(
-        i64::try_from(layout.manifest.artifact.original_size_bytes)
-            .map_err(|_| MaintenanceError::Operation)?,
-    )
-    .bind(layout.expires_at)
+    .bind(i64::try_from(artifact.original_size_bytes).map_err(|_| MaintenanceError::Operation)?)
+    .bind(expires_at)
     .bind(status)
-    .bind(layout.upload_id)
+    .bind(&upload.id)
     .execute(&mut *transaction)
     .await
     .map_err(|_| MaintenanceError::Operation)?;
-    if layout.accepted {
+    sqlx::query(
+        "UPDATE upload_artifacts SET chunk_count = ?1
+         WHERE upload_id = ?2 AND artifact_index = 0",
+    )
+    .bind(i64::from(stored_size != 0))
+    .bind(&upload.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+    if accepted {
         sqlx::query(
             "INSERT INTO upload_chunks (
                 upload_id, artifact_index, chunk_index, byte_length, sha256, accepted_at
              ) VALUES (?1, 0, 0, ?2, ?3, ?4)
              ON CONFLICT(upload_id, artifact_index, chunk_index) DO NOTHING",
         )
-        .bind(layout.upload_id)
+        .bind(&upload.id)
         .bind(i64::try_from(stored_size).map_err(|_| MaintenanceError::Operation)?)
-        .bind(digest_storage_value(
-            &layout.manifest.artifact.stored_sha256,
-        ))
-        .bind(layout.now)
+        .bind(digest_storage_value(&artifact.stored_sha256))
+        .bind(now)
         .execute(&mut *transaction)
         .await
         .map_err(|_| MaintenanceError::Operation)?;
@@ -2232,7 +2839,192 @@ async fn persist_legacy_layout(
     transaction
         .commit()
         .await
-        .map_err(|_| MaintenanceError::Operation)
+        .map_err(|_| MaintenanceError::Operation)?;
+    if accepted {
+        StorageLayout::remove_file(&source)
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+    }
+    Ok(())
+}
+
+async fn migrate_legacy_file(
+    state: &AppState,
+    upload_id: &str,
+    artifact: &Artifact,
+    source: &Path,
+) -> Result<bool, MaintenanceError> {
+    let stored_size = artifact.stored_size_bytes;
+    if stored_size == 0
+        || !fs::try_exists(source)
+            .await
+            .map_err(|_| MaintenanceError::Operation)?
+        || verify_stored_file(source.to_path_buf(), stored_size, &artifact.stored_sha256)
+            .await
+            .is_err()
+    {
+        return Ok(false);
+    }
+    state
+        .storage
+        .ensure_chunk_dir(upload_id, 0)
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    let destination = state.storage.artifact_chunk_path(upload_id, 0, 0);
+    match fs::hard_link(source, &destination).await {
+        Ok(()) => {
+            sync_parent_directory(&destination)
+                .await
+                .map_err(|_| MaintenanceError::Operation)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Ok(
+                verify_stored_file(destination, stored_size, &artifact.stored_sha256)
+                    .await
+                    .is_ok(),
+            )
+        }
+        Err(_) => Err(MaintenanceError::Operation),
+    }
+}
+
+#[derive(FromRow)]
+struct RecoveryUploadRow {
+    id: String,
+    status: String,
+}
+
+async fn recover_active_upload(
+    state: &AppState,
+    upload: &RecoveryUploadRow,
+) -> Result<(), MaintenanceError> {
+    let artifacts = get_upload_artifacts(&state.database, &upload.id)
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    if artifacts.is_empty() {
+        return Err(MaintenanceError::Operation);
+    }
+    for artifact in &artifacts {
+        recover_artifact_chunks(state, &upload.id, artifact).await?;
+    }
+    let complete = upload_is_complete(&state.database, &upload.id)
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    let status = if complete {
+        "artifact_uploaded"
+    } else {
+        "created"
+    };
+    sqlx::query(
+        "UPDATE uploads SET status = ?1
+         WHERE id = ?2 AND status IN ('created', 'artifact_uploaded')",
+    )
+    .bind(status)
+    .bind(&upload.id)
+    .execute(&state.database)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+
+    let upload_dir = state.storage.upload_dir(&upload.id);
+    match fs::read_dir(&upload_dir).await {
+        Ok(mut entries) => {
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|_| MaintenanceError::Operation)?
+            {
+                let name = entry.file_name();
+                let Ok(name) = name.into_string() else {
+                    continue;
+                };
+                if name.starts_with(".assembled-") || name == "artifact" {
+                    remove_recovery_entry(&entry.path()).await?;
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(MaintenanceError::Operation),
+    }
+    Ok(())
+}
+
+async fn recover_artifact_chunks(
+    state: &AppState,
+    upload_id: &str,
+    artifact: &UploadArtifactRow,
+) -> Result<(), MaintenanceError> {
+    let artifact_index =
+        u32::try_from(artifact.artifact_index).map_err(|_| MaintenanceError::Operation)?;
+    let rows = sqlx::query_as::<_, ChunkRow>(
+        "SELECT chunk_index, byte_length, sha256 FROM upload_chunks
+         WHERE upload_id = ?1 AND artifact_index = ?2",
+    )
+    .bind(upload_id)
+    .bind(artifact.artifact_index)
+    .fetch_all(&state.database)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+    for row in rows {
+        let chunk_index =
+            u64::try_from(row.chunk_index).map_err(|_| MaintenanceError::Operation)?;
+        let length = u64::try_from(row.byte_length).map_err(|_| MaintenanceError::Operation)?;
+        let path = state
+            .storage
+            .artifact_chunk_path(upload_id, artifact_index, chunk_index);
+        if verify_stored_file(path.clone(), length, &row.sha256)
+            .await
+            .is_err()
+        {
+            sqlx::query(
+                "DELETE FROM upload_chunks
+                 WHERE upload_id = ?1 AND artifact_index = ?2 AND chunk_index = ?3",
+            )
+            .bind(upload_id)
+            .bind(artifact.artifact_index)
+            .bind(row.chunk_index)
+            .execute(&state.database)
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+            let _ = StorageLayout::remove_file(&path).await;
+        }
+    }
+    let valid_rows = sqlx::query_as::<_, ChunkRow>(
+        "SELECT chunk_index, byte_length, sha256 FROM upload_chunks
+         WHERE upload_id = ?1 AND artifact_index = ?2",
+    )
+    .bind(upload_id)
+    .bind(artifact.artifact_index)
+    .fetch_all(&state.database)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+    let accepted = valid_rows
+        .into_iter()
+        .map(|row| u64::try_from(row.chunk_index))
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|_| MaintenanceError::Operation)?;
+    let chunk_dir = state.storage.artifact_chunk_dir(upload_id, artifact_index);
+    match fs::read_dir(&chunk_dir).await {
+        Ok(mut entries) => {
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|_| MaintenanceError::Operation)?
+            {
+                let name = entry.file_name();
+                let Ok(name) = name.into_string() else {
+                    continue;
+                };
+                let parsed_index = name.parse::<u64>().ok();
+                if !parsed_index.is_some_and(|index| accepted.contains(&index)) {
+                    remove_recovery_entry(&entry.path()).await?;
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(MaintenanceError::Operation),
+    }
+    Ok(())
 }
 
 async fn recover_unreferenced_blobs(state: &AppState) -> Result<(), MaintenanceError> {
@@ -2339,110 +3131,6 @@ async fn remove_unknown_upload_directories(
     Ok(())
 }
 
-async fn recover_active_upload(
-    state: &AppState,
-    upload: &RecoveryUploadRow,
-) -> Result<(), MaintenanceError> {
-    let rows = sqlx::query_as::<_, ChunkRow>(
-        "SELECT chunk_index, byte_length, sha256 FROM upload_chunks
-         WHERE upload_id = ?1 AND artifact_index = 0",
-    )
-    .bind(&upload.id)
-    .fetch_all(&state.database)
-    .await
-    .map_err(|_| MaintenanceError::Operation)?;
-    let accepted: HashSet<u64> = rows
-        .iter()
-        .map(|row| u64::try_from(row.chunk_index))
-        .collect::<Result<_, _>>()
-        .map_err(|_| MaintenanceError::Operation)?;
-    for row in rows {
-        let chunk_index =
-            u64::try_from(row.chunk_index).map_err(|_| MaintenanceError::Operation)?;
-        let path = state.storage.chunk_path(&upload.id, chunk_index);
-        if !fs::try_exists(&path)
-            .await
-            .map_err(|_| MaintenanceError::Operation)?
-        {
-            sqlx::query(
-                "DELETE FROM upload_chunks
-                 WHERE upload_id = ?1 AND artifact_index = 0 AND chunk_index = ?2",
-            )
-            .bind(&upload.id)
-            .bind(row.chunk_index)
-            .execute(&state.database)
-            .await
-            .map_err(|_| MaintenanceError::Operation)?;
-        }
-    }
-
-    let chunk_dir = state.storage.chunk_dir(&upload.id);
-    match fs::read_dir(&chunk_dir).await {
-        Ok(mut entries) => {
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|_| MaintenanceError::Operation)?
-            {
-                let name = entry.file_name();
-                let Ok(name) = name.into_string() else {
-                    continue;
-                };
-                let parsed_index = name.parse::<u64>().ok();
-                if !parsed_index.is_some_and(|index| accepted.contains(&index)) {
-                    remove_recovery_entry(&entry.path()).await?;
-                }
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(MaintenanceError::Operation),
-    }
-
-    let accepted_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM upload_chunks WHERE upload_id = ?1 AND artifact_index = 0",
-    )
-    .bind(&upload.id)
-    .fetch_one(&state.database)
-    .await
-    .map_err(|_| MaintenanceError::Operation)?;
-    let status = if accepted_count.0 == upload.chunk_count {
-        "artifact_uploaded"
-    } else {
-        "created"
-    };
-    sqlx::query(
-        "UPDATE uploads SET status = ?1
-         WHERE id = ?2 AND status IN ('created', 'artifact_uploaded')",
-    )
-    .bind(status)
-    .bind(&upload.id)
-    .execute(&state.database)
-    .await
-    .map_err(|_| MaintenanceError::Operation)?;
-
-    let upload_dir = state.storage.upload_dir(&upload.id);
-    match fs::read_dir(&upload_dir).await {
-        Ok(mut entries) => {
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|_| MaintenanceError::Operation)?
-            {
-                let name = entry.file_name();
-                let Ok(name) = name.into_string() else {
-                    continue;
-                };
-                if name.starts_with(".assembled-") || name == "artifact" {
-                    remove_recovery_entry(&entry.path()).await?;
-                }
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => return Err(MaintenanceError::Operation),
-    }
-    Ok(())
-}
-
 async fn remove_recovery_entry(path: &Path) -> Result<(), MaintenanceError> {
     let metadata = fs::symlink_metadata(path)
         .await
@@ -2459,20 +3147,96 @@ async fn remove_recovery_entry(path: &Path) -> Result<(), MaintenanceError> {
 }
 
 #[derive(FromRow)]
-struct RecoveryUploadRow {
-    id: String,
-    status: String,
-    chunk_count: i64,
-}
-
-#[derive(FromRow)]
 struct OrphanedBlobRow {
     id: String,
     stored_sha256: String,
 }
 
 #[derive(FromRow)]
-struct LegacyUploadRow {
-    id: String,
+struct ReconcileSnapshotRow {
     canonical_json: String,
+    manifest_sha256: String,
+    artifact_count: i64,
+    total_original_size_bytes: i64,
+    total_stored_size_bytes: i64,
+}
+
+#[derive(FromRow)]
+struct ReconcileArtifactRow {
+    artifact_index: i64,
+    logical_path: String,
+    media_type: Option<String>,
+    original_size_bytes: i64,
+    original_sha256: String,
+    stored_size_bytes: i64,
+    stored_sha256: String,
+    compression: String,
+}
+
+/// Checks one snapshot's normalized rows against its immutable canonical
+/// manifest. It detects drift but deliberately does not repair it or scan
+/// every snapshot/blob in the archive.
+pub(crate) async fn reconcile_snapshot(
+    database: &SqlitePool,
+    snapshot_id: &str,
+) -> Result<(), ReconciliationError> {
+    let snapshot = sqlx::query_as::<_, ReconcileSnapshotRow>(
+        "SELECT m.canonical_json, m.sha256 AS manifest_sha256, s.artifact_count,
+                s.total_original_size_bytes, s.total_stored_size_bytes
+         FROM snapshots s JOIN manifests m ON m.id = s.manifest_id
+         WHERE s.id = ?1",
+    )
+    .bind(snapshot_id)
+    .fetch_optional(database)
+    .await
+    .map_err(|_| ReconciliationError::Metadata)?
+    .ok_or(ReconciliationError::NotFound)?;
+    if sha256_hex(snapshot.canonical_json.as_bytes()) != snapshot.manifest_sha256 {
+        return Err(ReconciliationError::Drift);
+    }
+    let manifest: Manifest =
+        serde_json::from_str(&snapshot.canonical_json).map_err(|_| ReconciliationError::Drift)?;
+    let rows = sqlx::query_as::<_, ReconcileArtifactRow>(
+        "SELECT a.artifact_index, a.logical_path, a.media_type, a.original_size_bytes,
+                a.original_sha256, b.stored_size_bytes, b.stored_sha256, b.compression
+         FROM artifacts a JOIN blobs b ON b.id = a.blob_id
+         WHERE a.snapshot_id = ?1 ORDER BY a.artifact_index",
+    )
+    .bind(snapshot_id)
+    .fetch_all(database)
+    .await
+    .map_err(|_| ReconciliationError::Metadata)?;
+    if rows.len() != manifest.artifacts.len()
+        || snapshot.artifact_count
+            != i64::try_from(manifest.artifacts.len()).map_err(|_| ReconciliationError::Drift)?
+    {
+        return Err(ReconciliationError::Drift);
+    }
+    let (original_total, stored_total) =
+        manifest_totals(&manifest).map_err(|_| ReconciliationError::Drift)?;
+    if snapshot.total_original_size_bytes
+        != i64::try_from(original_total).map_err(|_| ReconciliationError::Drift)?
+        || snapshot.total_stored_size_bytes
+            != i64::try_from(stored_total).map_err(|_| ReconciliationError::Drift)?
+    {
+        return Err(ReconciliationError::Drift);
+    }
+    for (index, (artifact, row)) in manifest.artifacts.iter().zip(rows).enumerate() {
+        if row.artifact_index != i64::try_from(index).map_err(|_| ReconciliationError::Drift)?
+            || row.logical_path != artifact.logical_path
+            || row.media_type != artifact.media_type
+            || row.original_size_bytes
+                != i64::try_from(artifact.original_size_bytes)
+                    .map_err(|_| ReconciliationError::Drift)?
+            || row.original_sha256 != digest_storage_value(&artifact.original_sha256)
+            || row.stored_size_bytes
+                != i64::try_from(artifact.stored_size_bytes)
+                    .map_err(|_| ReconciliationError::Drift)?
+            || row.stored_sha256 != digest_storage_value(&artifact.stored_sha256)
+            || row.compression != compression_name(artifact.compression)
+        {
+            return Err(ReconciliationError::Drift);
+        }
+    }
+    Ok(())
 }

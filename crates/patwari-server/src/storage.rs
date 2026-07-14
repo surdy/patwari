@@ -49,25 +49,39 @@ impl StorageLayout {
         self.uploads.join(upload_id)
     }
 
-    pub(crate) fn chunk_dir(&self, upload_id: &str) -> PathBuf {
+    pub(crate) fn artifact_chunk_dir(&self, upload_id: &str, artifact_index: u32) -> PathBuf {
         self.upload_dir(upload_id)
             .join("artifacts")
-            .join("0")
+            .join(artifact_index.to_string())
             .join("chunks")
     }
 
+    /// Legacy artifact-zero chunk path.
+    #[cfg(test)]
     pub(crate) fn chunk_path(&self, upload_id: &str, chunk_index: u64) -> PathBuf {
-        self.chunk_dir(upload_id).join(chunk_index.to_string())
+        self.artifact_chunk_path(upload_id, 0, chunk_index)
     }
 
-    pub(crate) fn staged_chunk_path(&self, upload_id: &str) -> PathBuf {
-        self.chunk_dir(upload_id)
+    pub(crate) fn artifact_chunk_path(
+        &self,
+        upload_id: &str,
+        artifact_index: u32,
+        chunk_index: u64,
+    ) -> PathBuf {
+        self.artifact_chunk_dir(upload_id, artifact_index)
+            .join(chunk_index.to_string())
+    }
+
+    pub(crate) fn staged_chunk_path(&self, upload_id: &str, artifact_index: u32) -> PathBuf {
+        self.artifact_chunk_dir(upload_id, artifact_index)
             .join(format!(".chunk-{}.partial", Uuid::now_v7()))
     }
 
-    pub(crate) fn assembled_path(&self, upload_id: &str) -> PathBuf {
-        self.upload_dir(upload_id)
-            .join(format!(".assembled-{}.partial", Uuid::now_v7()))
+    pub(crate) fn assembled_artifact_path(&self, upload_id: &str, artifact_index: u32) -> PathBuf {
+        self.upload_dir(upload_id).join(format!(
+            ".assembled-{artifact_index}-{}.partial",
+            Uuid::now_v7()
+        ))
     }
 
     pub(crate) fn blob_path(&self, stored_sha256: &str) -> PathBuf {
@@ -77,8 +91,12 @@ impl StorageLayout {
             .join(stored_sha256)
     }
 
-    pub(crate) async fn ensure_chunk_dir(&self, upload_id: &str) -> Result<(), io::Error> {
-        fs::create_dir_all(self.chunk_dir(upload_id)).await
+    pub(crate) async fn ensure_chunk_dir(
+        &self,
+        upload_id: &str,
+        artifact_index: u32,
+    ) -> Result<(), io::Error> {
+        fs::create_dir_all(self.artifact_chunk_dir(upload_id, artifact_index)).await
     }
 
     pub(crate) async fn remove_upload_dir(&self, upload_id: &str) -> Result<(), io::Error> {

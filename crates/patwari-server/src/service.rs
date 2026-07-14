@@ -23,6 +23,7 @@ use crate::{
 };
 
 pub use crate::database::{ArchiveIdentity, BootstrapError};
+pub use crate::ingestion::ReconciliationError;
 
 #[derive(Debug, Error)]
 pub enum MaintenanceError {
@@ -54,6 +55,9 @@ pub(crate) struct AppState {
     pub(crate) chunk_size_bytes: u64,
     pub(crate) max_artifact_stored_bytes: u64,
     pub(crate) max_artifact_original_bytes: u64,
+    pub(crate) max_artifact_count: usize,
+    pub(crate) max_snapshot_stored_bytes: u64,
+    pub(crate) max_snapshot_original_bytes: u64,
     pub(crate) upload_expiry: std::time::Duration,
     upload_locks: [Arc<AsyncMutex<()>>; UPLOAD_LOCK_STRIPES],
     blob_locks: [Arc<AsyncMutex<()>>; BLOB_LOCK_STRIPES],
@@ -191,17 +195,25 @@ impl AppState {
         self.upload_locks[upload_lock_stripe(upload_id)].clone()
     }
 
-    /// Returns the fixed stripe lock serializing canonical-blob operations
-    /// for `stored_sha256` within `owner_namespace`. Holders of this lock
-    /// must never attempt to acquire an upload lock (see the ordering note
-    /// on `blob_lock_stripe`); the reverse order (upload lock, then blob
-    /// lock) is safe and is how `complete_upload` uses it.
-    pub(crate) fn blob_lock(
+    /// Returns each lock stripe needed for a set of blob digests exactly once,
+    /// in ascending deterministic order. Acquiring a mutex once per digest
+    /// could recursively acquire the same collision stripe, while a common
+    /// stripe order prevents cycles between overlapping digest sets.
+    pub(crate) fn blob_locks_for_digests(
         &self,
         owner_namespace: &str,
-        stored_sha256: &str,
-    ) -> Arc<AsyncMutex<()>> {
-        self.blob_locks[blob_lock_stripe(owner_namespace, stored_sha256)].clone()
+        stored_sha256s: &[String],
+    ) -> Vec<Arc<AsyncMutex<()>>> {
+        let mut stripes = stored_sha256s
+            .iter()
+            .map(|digest| blob_lock_stripe(owner_namespace, digest))
+            .collect::<Vec<_>>();
+        stripes.sort_unstable();
+        stripes.dedup();
+        stripes
+            .into_iter()
+            .map(|stripe| self.blob_locks[stripe].clone())
+            .collect()
     }
 }
 
@@ -227,10 +239,10 @@ fn upload_lock_stripe(upload_id: &str) -> usize {
 /// lock acquires the upload lock first, then the blob lock, and releases the
 /// blob lock before or when it releases the upload lock. No path acquires a
 /// blob lock and then waits on an upload lock, so the two lock families
-/// cannot deadlock against each other. A single `SQLite` write transaction may
-/// be opened and committed/rolled back while holding a blob lock, but a blob
-/// lock is never held across two separate transactions and no transaction
-/// is left open while waiting to acquire a blob lock.
+/// cannot deadlock against each other. A `SQLite` transaction may be opened,
+/// committed, rolled back, and followed by conditional cleanup while holding
+/// blob locks; no transaction is ever left open while waiting to acquire a
+/// blob lock.
 fn blob_lock_stripe(owner_namespace: &str, stored_sha256: &str) -> usize {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -272,6 +284,9 @@ impl Service {
             chunk_size_bytes,
             max_artifact_stored_bytes: config.max_artifact_stored_bytes,
             max_artifact_original_bytes: config.max_artifact_original_bytes,
+            max_artifact_count: config.max_artifact_count,
+            max_snapshot_stored_bytes: config.max_snapshot_stored_bytes,
+            max_snapshot_original_bytes: config.max_snapshot_original_bytes,
             upload_expiry: config.upload_expiry,
             upload_locks: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
             blob_locks: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
@@ -298,7 +313,7 @@ impl Service {
                 get(ingestion::get_upload_status),
             )
             .route(
-                "/uploads/{upload_id}/artifacts/0/chunks/{chunk_index}",
+                "/uploads/{upload_id}/artifacts/{artifact_index}/chunks/{chunk_index}",
                 put(ingestion::put_artifact_chunk),
             )
             .route(
@@ -353,6 +368,17 @@ impl Service {
     /// remove temporary upload storage.
     pub async fn expire_uploads(&self) -> Result<usize, MaintenanceError> {
         ingestion::expire_uploads_at(&self.state, time::OffsetDateTime::now_utc()).await
+    }
+
+    /// Compares one snapshot's canonical manifest with its normalized
+    /// Artifact/Blob projection without attempting broad integrity scanning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot is absent, its immutable manifest
+    /// cannot be read, or its normalized metadata has drifted from it.
+    pub async fn reconcile_snapshot(&self, snapshot_id: &str) -> Result<(), ReconciliationError> {
+        ingestion::reconcile_snapshot(&self.state.database, snapshot_id).await
     }
 
     #[cfg(test)]

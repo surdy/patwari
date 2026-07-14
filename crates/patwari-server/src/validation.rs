@@ -1,9 +1,14 @@
+use std::collections::{BTreeMap, HashSet};
+
 use axum::http::{HeaderMap, header};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
-    contract::{Artifact, Capture, CaptureInput, Manifest, ManifestInput, RegisterClientRequest},
+    contract::{
+        Artifact, ArtifactInput, Capture, CaptureInput, Compression, Manifest, ManifestInput,
+        RegisterClientRequest,
+    },
     error::ApiError,
 };
 
@@ -15,6 +20,19 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const MAX_SOURCE_AGENT_BYTES: usize = 128;
 const MAX_SOURCE_SESSION_ID_BYTES: usize = 512;
 const MAX_CONTEXT_VALUE_BYTES: usize = 512;
+const WINDOWS_RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+#[derive(Clone, Copy)]
+pub(crate) struct ManifestLimits {
+    pub(crate) artifact_count: usize,
+    pub(crate) artifact_stored_bytes: u64,
+    pub(crate) artifact_original_bytes: u64,
+    pub(crate) snapshot_stored_bytes: u64,
+    pub(crate) snapshot_original_bytes: u64,
+}
 
 pub(crate) fn validate_client_request(request: &RegisterClientRequest) -> Result<(), ApiError> {
     validate_optional_text(request.hostname.as_ref(), MAX_CONTEXT_VALUE_BYTES)?;
@@ -35,8 +53,7 @@ pub(crate) fn validate_idempotency_key(key: &str) -> Result<(), ApiError> {
 
 pub(crate) fn normalize_manifest(
     input: ManifestInput,
-    max_stored_bytes: u64,
-    max_original_bytes: u64,
+    limits: ManifestLimits,
 ) -> Result<Manifest, ApiError> {
     if input.schema_version != 1 {
         return Err(ApiError::invalid(
@@ -54,35 +71,147 @@ pub(crate) fn normalize_manifest(
         "source session identifier is invalid",
     )?;
     let capture = normalize_capture(input.capture)?;
-    validate_logical_path(&input.artifact.logical_path)?;
-    validate_optional_media_type(input.artifact.media_type.as_ref())?;
-    validate_digest(&input.artifact.original_sha256)?;
-    validate_digest(&input.artifact.stored_sha256)?;
-    validate_size(
-        input.artifact.original_size_bytes,
-        max_original_bytes,
-        "artifact original size exceeds the configured bounded limit",
-    )?;
-    validate_size(
-        input.artifact.stored_size_bytes,
-        max_stored_bytes,
-        "artifact stored size exceeds the configured bounded limit",
-    )?;
+    let artifacts = match (input.artifacts, input.artifact) {
+        (Some(artifacts), None) => artifacts,
+        (None, Some(artifact)) => vec![artifact],
+        _ => {
+            return Err(ApiError::invalid(
+                "manifest must declare exactly one artifacts array or legacy artifact",
+            ));
+        }
+    };
+    if artifacts.is_empty() || artifacts.len() > limits.artifact_count {
+        return Err(ApiError::invalid(
+            "manifest artifact count exceeds the configured bounded limit",
+        ));
+    }
 
+    let mut normalized = Vec::with_capacity(artifacts.len());
+    let mut original_total = 0_u64;
+    let mut stored_total = 0_u64;
+    let mut portable_paths = HashSet::with_capacity(artifacts.len());
+    let mut representations = BTreeMap::<String, (u64, Compression)>::new();
+    for artifact in artifacts {
+        normalize_artifact(
+            artifact,
+            limits,
+            &mut original_total,
+            &mut stored_total,
+            &mut portable_paths,
+            &mut representations,
+            &mut normalized,
+        )?;
+    }
+    if portable_paths.iter().any(|path| {
+        let mut parent = path.as_str();
+        while let Some((prefix, _)) = parent.rsplit_once('/') {
+            if portable_paths.contains(prefix) {
+                return true;
+            }
+            parent = prefix;
+        }
+        false
+    }) {
+        return Err(ApiError::invalid(
+            "manifest contains conflicting regular-file logical paths",
+        ));
+    }
+    normalized.sort_unstable_by(|left, right| left.logical_path.cmp(&right.logical_path));
     Ok(Manifest {
         schema_version: input.schema_version,
         session: input.session,
         capture,
-        artifact: Artifact {
-            logical_path: input.artifact.logical_path,
-            media_type: input.artifact.media_type,
-            original_size_bytes: input.artifact.original_size_bytes,
-            original_sha256: input.artifact.original_sha256,
-            stored_size_bytes: input.artifact.stored_size_bytes,
-            stored_sha256: input.artifact.stored_sha256,
-            compression: input.artifact.compression,
-        },
+        artifacts: normalized,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_artifact(
+    input: ArtifactInput,
+    limits: ManifestLimits,
+    original_total: &mut u64,
+    stored_total: &mut u64,
+    portable_paths: &mut HashSet<String>,
+    representations: &mut BTreeMap<String, (u64, Compression)>,
+    normalized: &mut Vec<Artifact>,
+) -> Result<(), ApiError> {
+    validate_logical_path(&input.logical_path)?;
+    let portable_path = input.logical_path.to_ascii_lowercase();
+    if !portable_paths.insert(portable_path) {
+        return Err(ApiError::invalid(
+            "manifest contains duplicate normalized logical paths",
+        ));
+    }
+    validate_optional_media_type(input.media_type.as_ref())?;
+    validate_digest(&input.original_sha256)?;
+    validate_digest(&input.stored_sha256)?;
+    validate_size(
+        input.original_size_bytes,
+        limits.artifact_original_bytes,
+        "artifact original size exceeds the configured bounded limit",
+    )?;
+    validate_size(
+        input.stored_size_bytes,
+        limits.artifact_stored_bytes,
+        "artifact stored size exceeds the configured bounded limit",
+    )?;
+    *original_total = original_total
+        .checked_add(input.original_size_bytes)
+        .ok_or_else(|| ApiError::invalid("snapshot original size is invalid"))?;
+    if *original_total > limits.snapshot_original_bytes {
+        return Err(ApiError::invalid(
+            "snapshot original size exceeds the configured bounded limit",
+        ));
+    }
+    *stored_total = stored_total
+        .checked_add(input.stored_size_bytes)
+        .ok_or_else(|| ApiError::invalid("snapshot stored size is invalid"))?;
+    if *stored_total > limits.snapshot_stored_bytes {
+        return Err(ApiError::invalid(
+            "snapshot stored size exceeds the configured bounded limit",
+        ));
+    }
+    let stored_digest = input
+        .stored_sha256
+        .strip_prefix("sha256:")
+        .expect("digest validation requires sha256 prefix");
+    if let Some((size, compression)) = representations.get(stored_digest) {
+        if *size != input.stored_size_bytes || *compression != input.compression {
+            return Err(ApiError::invalid(
+                "shared stored bytes must declare one unambiguous representation",
+            ));
+        }
+    } else {
+        representations.insert(
+            stored_digest.to_owned(),
+            (input.stored_size_bytes, input.compression),
+        );
+    }
+    normalized.push(Artifact {
+        logical_path: input.logical_path,
+        media_type: input.media_type,
+        original_size_bytes: input.original_size_bytes,
+        original_sha256: input.original_sha256,
+        stored_size_bytes: input.stored_size_bytes,
+        stored_sha256: input.stored_sha256,
+        compression: input.compression,
+    });
+    Ok(())
+}
+
+pub(crate) fn manifest_totals(manifest: &Manifest) -> Result<(u64, u64), ApiError> {
+    manifest
+        .artifacts
+        .iter()
+        .try_fold((0_u64, 0_u64), |(original, stored), artifact| {
+            let original = original
+                .checked_add(artifact.original_size_bytes)
+                .ok_or_else(|| ApiError::invalid("snapshot original size is invalid"))?;
+            let stored = stored
+                .checked_add(artifact.stored_size_bytes)
+                .ok_or_else(|| ApiError::invalid("snapshot stored size is invalid"))?;
+            Ok((original, stored))
+        })
 }
 
 fn normalize_capture(input: CaptureInput) -> Result<Capture, ApiError> {
@@ -123,16 +252,32 @@ fn validate_logical_path(path: &str) -> Result<(), ApiError> {
         || path.len() > MAX_LOGICAL_PATH_BYTES
         || path.starts_with('/')
         || path.contains('\\')
+        || path.contains(':')
+        || !path.is_ascii()
         || path.bytes().any(|byte| byte.is_ascii_control())
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
+        || path.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.ends_with('.')
+                || part.ends_with(' ')
+                || is_windows_reserved_component(part)
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
     {
         return Err(ApiError::invalid(
-            "logical path must be a normalized relative regular-file path",
+            "logical path must be a portable normalized relative regular-file path",
         ));
     }
+
     Ok(())
+}
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let basename = component.split('.').next().unwrap_or(component);
+    WINDOWS_RESERVED_NAMES.contains(&basename.to_ascii_uppercase().as_str())
 }
 
 pub(crate) fn validate_digest(value: &str) -> Result<(), ApiError> {

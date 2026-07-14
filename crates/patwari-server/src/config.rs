@@ -10,6 +10,9 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_ARTIFACT_STORED_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_ARTIFACT_ORIGINAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_ARTIFACT_COUNT: usize = 128;
+pub const DEFAULT_MAX_SNAPSHOT_STORED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_SNAPSHOT_ORIGINAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_EXPIRY: Duration = Duration::from_hours(24);
 pub const MAX_CHUNK_COUNT: u64 = 65_536;
 
@@ -20,6 +23,8 @@ const MAX_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 const MIN_CHUNK_SIZE_BYTES: usize = 1024;
 const MAX_CHUNK_SIZE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_ARTIFACT_COUNT: usize = 1_024;
+const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MIN_UPLOAD_EXPIRY: Duration = Duration::from_mins(1);
 const MAX_UPLOAD_EXPIRY: Duration = Duration::from_hours(720);
 
@@ -33,6 +38,9 @@ pub struct Config {
     pub chunk_size_bytes: usize,
     pub max_artifact_stored_bytes: u64,
     pub max_artifact_original_bytes: u64,
+    pub max_artifact_count: usize,
+    pub max_snapshot_stored_bytes: u64,
+    pub max_snapshot_original_bytes: u64,
     pub upload_expiry: Duration,
 }
 
@@ -56,6 +64,12 @@ pub enum ConfigError {
     InvalidStoredArtifactLimit,
     #[error("PATWARI_MAX_ARTIFACT_ORIGINAL_BYTES must be between 1 and 8589934592 bytes")]
     InvalidOriginalArtifactLimit,
+    #[error("PATWARI_MAX_ARTIFACT_COUNT must be between 1 and 1024")]
+    InvalidArtifactCountLimit,
+    #[error("PATWARI_MAX_SNAPSHOT_STORED_BYTES must be between 1 and 68719476736 bytes")]
+    InvalidStoredSnapshotLimit,
+    #[error("PATWARI_MAX_SNAPSHOT_ORIGINAL_BYTES must be between 1 and 68719476736 bytes")]
+    InvalidOriginalSnapshotLimit,
     #[error("configured stored artifact limit would require too many chunks")]
     TooManyChunks,
     #[error("PATWARI_UPLOAD_EXPIRY must be a duration between 60s and 30d")]
@@ -75,6 +89,9 @@ impl Default for Config {
             chunk_size_bytes: DEFAULT_CHUNK_SIZE_BYTES,
             max_artifact_stored_bytes: DEFAULT_MAX_ARTIFACT_STORED_BYTES,
             max_artifact_original_bytes: DEFAULT_MAX_ARTIFACT_ORIGINAL_BYTES,
+            max_artifact_count: DEFAULT_MAX_ARTIFACT_COUNT,
+            max_snapshot_stored_bytes: DEFAULT_MAX_SNAPSHOT_STORED_BYTES,
+            max_snapshot_original_bytes: DEFAULT_MAX_SNAPSHOT_ORIGINAL_BYTES,
             upload_expiry: DEFAULT_UPLOAD_EXPIRY,
         }
     }
@@ -164,6 +181,21 @@ impl Config {
                 .ok_or(ConfigError::InvalidOriginalArtifactLimit)?;
         }
 
+        if let Some(value) = values.get("PATWARI_MAX_ARTIFACT_COUNT") {
+            config.max_artifact_count = parse_bounded_usize(value, 1, MAX_ARTIFACT_COUNT)
+                .ok_or(ConfigError::InvalidArtifactCountLimit)?;
+        }
+
+        if let Some(value) = values.get("PATWARI_MAX_SNAPSHOT_STORED_BYTES") {
+            config.max_snapshot_stored_bytes = parse_bounded_u64(value, 1, MAX_SNAPSHOT_BYTES)
+                .ok_or(ConfigError::InvalidStoredSnapshotLimit)?;
+        }
+
+        if let Some(value) = values.get("PATWARI_MAX_SNAPSHOT_ORIGINAL_BYTES") {
+            config.max_snapshot_original_bytes = parse_bounded_u64(value, 1, MAX_SNAPSHOT_BYTES)
+                .ok_or(ConfigError::InvalidOriginalSnapshotLimit)?;
+        }
+
         if let Some(value) = values.get("PATWARI_UPLOAD_EXPIRY") {
             config.upload_expiry = parse_duration(value)
                 .filter(|duration| *duration >= MIN_UPLOAD_EXPIRY && *duration <= MAX_UPLOAD_EXPIRY)
@@ -210,6 +242,19 @@ impl Config {
             || self.max_artifact_original_bytes > MAX_ARTIFACT_BYTES
         {
             return Err(ConfigError::InvalidOriginalArtifactLimit);
+        }
+        if !(1..=MAX_ARTIFACT_COUNT).contains(&self.max_artifact_count) {
+            return Err(ConfigError::InvalidArtifactCountLimit);
+        }
+        if self.max_snapshot_stored_bytes == 0
+            || self.max_snapshot_stored_bytes > MAX_SNAPSHOT_BYTES
+        {
+            return Err(ConfigError::InvalidStoredSnapshotLimit);
+        }
+        if self.max_snapshot_original_bytes == 0
+            || self.max_snapshot_original_bytes > MAX_SNAPSHOT_BYTES
+        {
+            return Err(ConfigError::InvalidOriginalSnapshotLimit);
         }
         if self.max_artifact_stored_bytes > max_stored_bytes_for_chunk_size(self.chunk_size_bytes)?
         {
@@ -276,6 +321,8 @@ mod tests {
         assert_eq!(config.max_concurrency, 64);
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.chunk_size_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.max_artifact_count, 128);
+        assert_eq!(config.max_snapshot_stored_bytes, 4 * 1024 * 1024 * 1024);
         assert_eq!(config.upload_expiry, Duration::from_hours(24));
     }
 
@@ -288,6 +335,9 @@ mod tests {
             ("PATWARI_UPLOAD_CHUNK_SIZE_BYTES".into(), "4096".into()),
             ("PATWARI_MAX_ARTIFACT_STORED_BYTES".into(), "4096".into()),
             ("PATWARI_MAX_ARTIFACT_ORIGINAL_BYTES".into(), "8192".into()),
+            ("PATWARI_MAX_ARTIFACT_COUNT".into(), "2".into()),
+            ("PATWARI_MAX_SNAPSHOT_STORED_BYTES".into(), "8192".into()),
+            ("PATWARI_MAX_SNAPSHOT_ORIGINAL_BYTES".into(), "16384".into()),
             ("PATWARI_MAX_CONCURRENCY".into(), "2".into()),
             ("PATWARI_REQUEST_TIMEOUT".into(), "5s".into()),
             ("PATWARI_UPLOAD_EXPIRY".into(), "2h".into()),
@@ -299,6 +349,9 @@ mod tests {
         assert_eq!(config.chunk_size_bytes, 4096);
         assert_eq!(config.max_artifact_stored_bytes, 4096);
         assert_eq!(config.max_artifact_original_bytes, 8192);
+        assert_eq!(config.max_artifact_count, 2);
+        assert_eq!(config.max_snapshot_stored_bytes, 8192);
+        assert_eq!(config.max_snapshot_original_bytes, 16384);
         assert_eq!(config.max_concurrency, 2);
         assert_eq!(config.request_timeout, Duration::from_secs(5));
         assert_eq!(config.upload_expiry, Duration::from_hours(2));
