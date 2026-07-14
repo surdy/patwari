@@ -15,6 +15,9 @@ Patwari is designed primarily for programmatic use:
 - batch access by tools that mine past sessions for learnings, reusable patterns, and skills;
 - verified archival receipts that allow Munshi to offer manual local cleanup.
 
+The canonical domain vocabulary is defined in [`CONTEXT.md`](CONTEXT.md). Architectural trade-offs are
+recorded in [`docs/adr/`](docs/adr/).
+
 ## Product decisions
 
 | Area | Decision |

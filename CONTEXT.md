@@ -1,0 +1,76 @@
+# Patwari Archive
+
+Patwari preserves verified, immutable captures of coding-agent sessions. It owns archival identity,
+provenance, and integrity; it does not interpret session content or curate human-readable knowledge.
+
+## Language
+
+**Owner**:
+The archive namespace within which sessions and stored content are identified and deduplicated. Patwari
+has one owner initially, even before authentication or multiple owners are supported.
+_Avoid_: Account, user, tenant
+
+**Client**:
+A persistent Munshi installation that submits captures to Patwari. A hostname or display name describes
+a client but does not identify it.
+_Avoid_: Device, machine, uploader
+
+**Session**:
+One open-ended logical coding-agent conversation, identified within an owner by its source agent and
+opaque source session ID. Moving the conversation between clients does not create a new session.
+_Avoid_: Upload, run, archive
+
+**Capture**:
+A client's observation of a session at a source-reported time and cursor. Repeated captures are retained
+as provenance even when they resolve to the same snapshot.
+_Avoid_: Snapshot, backup
+
+**Upload**:
+A resumable attempt to submit one capture's proposed manifest and artifact bytes. An upload may fail,
+expire, or resolve to an existing snapshot.
+_Avoid_: Snapshot, artifact
+
+**Snapshot**:
+An immutable, self-contained, verified session state. A snapshot is client-neutral and may be the result
+of multiple captures from different clients.
+_Avoid_: Upload, capture, revision
+
+**Capture context**:
+The stable source facts that distinguish a snapshot beyond its artifact contents, including repository,
+project, branch, source-agent version, and artifact-set version.
+_Avoid_: Session metadata, upload metadata
+
+**Manifest**:
+The canonical, authoritative description of a snapshot's capture context and complete artifact set.
+Normalized query data is a projection of the manifest.
+_Avoid_: Index, receipt
+
+**Snapshot fingerprint**:
+Patwari's canonical identity for a snapshot within a session, derived from verified original artifact
+content and stable capture context while excluding provenance and storage representation.
+_Avoid_: Source state hash, manifest hash, blob hash
+
+**Artifact**:
+One regular byte stream at a unique normalized logical path within a snapshot. An artifact describes
+original content and refers to a stored blob.
+_Avoid_: Blob, file object, chunk
+
+**Blob**:
+A verified stored representation of artifact content, deduplicated within an owner by its stored bytes.
+Different snapshots and artifacts may refer to the same blob.
+_Avoid_: Artifact, snapshot
+
+**Receipt**:
+A reproducible, versioned document proving that Patwari accepted and verified a snapshot. It identifies
+the issuing archive instance but is not an independently mutable record.
+_Avoid_: Certificate, snapshot
+
+**Tombstone**:
+The durable record that an archived resource was explicitly deleted. Re-archiving the same state creates
+a new snapshot rather than silently reviving the deleted one.
+_Avoid_: Soft delete, archived snapshot
+
+**Integrity finding**:
+A time-stamped observation of a snapshot or blob's current health. It does not rewrite the historical
+fact that a snapshot passed verification when it was completed.
+_Avoid_: Snapshot status, upload failure
