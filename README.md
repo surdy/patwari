@@ -47,6 +47,7 @@ Configuration is environment-based and bounded by default:
 | `PATWARI_BIND_ADDR` | `127.0.0.1:8080` | Listener; loopback is the safe default |
 | `PATWARI_MAX_REQUEST_BODY_BYTES` | `33554432` | Infrastructure request-body limit |
 | `PATWARI_MAX_CONCURRENCY` | `64` | Maximum concurrent requests |
+| `PATWARI_MAX_DOWNLOAD_CONCURRENCY` | `8` | Maximum concurrent artifact response bodies |
 | `PATWARI_REQUEST_TIMEOUT` | `30s` | Maximum request duration |
 | `PATWARI_UPLOAD_CHUNK_SIZE_BYTES` | `4194304` | Fixed server-assigned stored-byte chunk size |
 | `PATWARI_MAX_ARTIFACT_STORED_BYTES` | `1073741824` | Maximum declared compressed artifact size |
@@ -56,7 +57,8 @@ Configuration is environment-based and bounded by default:
 | `PATWARI_MAX_SNAPSHOT_ORIGINAL_BYTES` | `17179869184` | Maximum original-byte sum in one snapshot |
 | `PATWARI_UPLOAD_EXPIRY` | `24h` | Server-time lifetime of an unfinished upload |
 
-The body limit is 1 KiB–64 MiB, concurrency is 1–256, timeout is 1s–5m, chunk size is
+The body limit is 1 KiB–64 MiB, request concurrency is 1–256, download concurrency is 1–64,
+timeout is 1s–5m, chunk size is
 1 KiB–32 MiB, each artifact limit is 1 byte–8 GiB, a snapshot is limited to 1,024 artifacts and
 64 GiB per stored/original aggregate, and unfinished-upload expiry is 1m–30d.
 Chunk size must fit the request-body limit, and the configured stored-artifact limit must fit at
@@ -431,6 +433,52 @@ chunk indexes 0–7 with the least-significant bit representing index 0. Each `P
 valid length for each index, including the final chunk. For practical compatibility, a headerless
 `chunks/0` request is accepted only when the negotiated artifact has exactly one chunk; its
 canonical manifest supplies the equivalent persisted length and checksum contract.
+
+### Verified artifact content
+
+`GET /api/v1/artifacts/{artifact_id}/content` returns the **stored** bytes from the canonical blob;
+it never decompresses an artifact. Before it returns `200`, Patwari reads the opened blob descriptor
+in fixed 64 KiB chunks, rejects anything other than a regular file, verifies its exact stored size
+and SHA-256, and checks the Artifact/Blob projection against the snapshot's canonical manifest.
+The verified descriptor is rewound and used for the response, so a pathname replacement cannot
+substitute a different blob after preflight on Unix. Blob files are immutable by storage contract;
+the preflight also compares descriptor metadata before and after hashing to detect ordinary
+in-place mutation. No SQLite transaction or blob lock remains held while a client reads the body.
+
+If an artifact ID is absent, the endpoint returns `404 artifact_not_found`. If an existing artifact
+has missing, non-regular, truncated, corrupt, or projection-drifted storage, it returns
+`409 artifact_integrity_failure` before sending a success response. It never emits a
+success-shaped partial body for a blob that fails preflight.
+
+Every successful content response has this stable header contract. Stored digest headers and
+`X-Patwari-Stored-SHA256` cover bytes exactly as stored; original fields cover the decompressed
+original bytes. Patwari hash values use `sha256:` followed by 64 lowercase hexadecimal digits.
+
+| Header | Meaning |
+| --- | --- |
+| `Content-Type` | Declared artifact media type, or `application/octet-stream` when none was declared |
+| `Content-Length` | Exact stored-byte size |
+| `Content-Encoding: zstd` | Present only for Zstandard stored bytes; omitted for identity storage |
+| `Digest: SHA-256=<base64>` and `Content-Digest: sha-256=:<base64>:` | Standard digest forms for the exact stored response bytes |
+| `X-Patwari-Logical-Path` | Canonical logical path encoded as unpadded URL-safe Base64 |
+| `X-Patwari-Logical-Path-Encoding` | Always `base64url` |
+| `X-Patwari-Media-Type` | Declared media type when one was supplied; omitted otherwise |
+| `X-Patwari-Compression` | Canonical `identity` or `zstd` storage encoding |
+| `X-Patwari-Original-Size-Bytes`, `X-Patwari-Original-SHA256` | Verified uncompressed/original size and hash |
+| `X-Patwari-Stored-Size-Bytes`, `X-Patwari-Stored-SHA256` | Verified stored size and hash; these agree with `Content-Length` and the digest headers |
+
+`Cache-Control: no-transform` accompanies the response so intermediaries must not alter the
+stored-byte representation. An HTTP client that automatically decodes `Content-Encoding` must
+disable that behavior when it needs byte-for-byte blob verification. A client can verify the stored
+length/hash while streaming, then use `X-Patwari-Compression` to stream-decompress Zstandard bytes
+(or pass identity bytes through) and verify `X-Patwari-Original-Size-Bytes` and
+`X-Patwari-Original-SHA256`.
+
+The download concurrency cap is independent of general request concurrency. A permit remains held
+for the entire response body, including slow reads, and is released on completion, error, timeout,
+or disconnect. `PATWARI_REQUEST_TIMEOUT` also applies as a whole-body deadline because the generic
+Tower request timeout ends once a streaming response is constructed; the download deadline starts
+when that request begins.
 
 Capture provenance is available after successful completion by upload, by the `(client_id,
 capture_id)` query pair, by immutable capture-record ID, as a paginated archive-wide collection, or

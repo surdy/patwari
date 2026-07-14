@@ -1,9 +1,13 @@
-use std::{fs as stdfs, path::PathBuf, time::Duration};
+use std::{fs as stdfs, future::Future, io::Read, path::PathBuf, task::Poll, time::Duration};
 
 use axum::{
     Router,
     body::Body,
     http::{HeaderMap, Request, StatusCode, header},
+};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
@@ -118,6 +122,31 @@ fn digest(bytes: &[u8]) -> String {
         write!(output, "{byte:02x}").expect("writing to string succeeds");
     }
     output
+}
+
+fn digest_base64(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    STANDARD.encode(&digest[..])
+}
+
+fn digest_reader(mut reader: impl Read) -> (u64, String) {
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = reader.read(&mut buffer).expect("stream can be read");
+        if read == 0 {
+            break;
+        }
+        size += u64::try_from(read).expect("buffer length fits in u64");
+        hasher.update(&buffer[..read]);
+    }
+    let mut result = String::from("sha256:");
+    for byte in hasher.finalize() {
+        use std::fmt::Write;
+        write!(result, "{byte:02x}").expect("writing to string succeeds");
+    }
+    (size, result)
 }
 
 fn manifest(original: &[u8], stored: &[u8], compression: Compression) -> serde_json::Value {
@@ -1834,7 +1863,7 @@ async fn upload_full(
     stored_bytes: &[u8],
 ) -> UploadResponse {
     let upload = create_upload(service, config, client_id, capture_id, manifest_document).await;
-    for (index, bytes) in stored_bytes.chunks(1024).enumerate() {
+    for (index, bytes) in stored_bytes.chunks(config.chunk_size_bytes).enumerate() {
         assert_eq!(
             upload_chunk(service, config, &upload.upload_id, index as u64, bytes).await,
             StatusCode::NO_CONTENT
@@ -3834,4 +3863,477 @@ async fn archive_browsing_excludes_incomplete_and_tombstoned_snapshots_after_res
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn artifact_downloads_expose_verified_stored_metadata_for_identity_and_zstd() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let identity_original = b"identity artifact\n".repeat(300);
+    let zstd_original = b"zstd artifact with independently verified original bytes\n".repeat(900);
+    let zstd_stored = zstd::stream::encode_all(&zstd_original[..], 1).expect("compresses");
+    let upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "verified-download-headers",
+        multi_manifest(
+            vec![
+                (
+                    "identity.bin",
+                    &identity_original,
+                    &identity_original,
+                    Compression::Identity,
+                ),
+                ("zstd.bin", &zstd_original, &zstd_stored, Compression::Zstd),
+            ],
+            "verified-download-headers",
+        ),
+    )
+    .await;
+    for (artifact_index, stored) in [
+        (0_u32, identity_original.as_slice()),
+        (1_u32, zstd_stored.as_slice()),
+    ] {
+        for (chunk_index, chunk) in stored.chunks(1024).enumerate() {
+            assert_eq!(
+                upload_artifact_chunk(
+                    &service,
+                    &config,
+                    &upload.upload_id,
+                    artifact_index,
+                    u64::try_from(chunk_index).expect("chunk index fits"),
+                    chunk,
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let snapshot = fetch_snapshot(&service, &config, &completion.receipt.snapshot_id).await;
+    let identity = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.logical_path == "identity.bin")
+        .expect("identity artifact is present");
+    let zstd = snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.logical_path == "zstd.bin")
+        .expect("zstd artifact is present");
+
+    let (identity_status, identity_headers, identity_downloaded) = call(
+        service.router(&config),
+        Request::builder()
+            .uri(&identity.content_url)
+            .body(Body::empty())
+            .expect("identity content request is valid"),
+    )
+    .await;
+    assert_eq!(identity_status, StatusCode::OK);
+    assert_eq!(identity_downloaded, identity_original);
+    assert_eq!(
+        identity_headers[header::CONTENT_TYPE],
+        "application/octet-stream"
+    );
+    assert_eq!(
+        identity_headers[header::CONTENT_LENGTH],
+        identity_original.len().to_string()
+    );
+    assert!(identity_headers.get(header::CONTENT_ENCODING).is_none());
+    assert_eq!(identity_headers[header::CACHE_CONTROL], "no-transform");
+    assert_eq!(
+        identity_headers["digest"],
+        format!("SHA-256={}", digest_base64(&identity_original))
+    );
+    assert_eq!(
+        identity_headers["content-digest"],
+        format!("sha-256=:{}:", digest_base64(&identity_original))
+    );
+    assert_eq!(
+        identity_headers["x-patwari-logical-path"],
+        URL_SAFE_NO_PAD.encode("identity.bin")
+    );
+    assert_eq!(
+        identity_headers["x-patwari-logical-path-encoding"],
+        "base64url"
+    );
+    assert_eq!(
+        identity_headers["x-patwari-media-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(identity_headers["x-patwari-compression"], "identity");
+    assert_eq!(
+        identity_headers["x-patwari-original-size-bytes"],
+        identity_original.len().to_string()
+    );
+    assert_eq!(
+        identity_headers["x-patwari-original-sha256"],
+        digest(&identity_original)
+    );
+    assert_eq!(
+        identity_headers["x-patwari-stored-size-bytes"],
+        identity_original.len().to_string()
+    );
+    assert_eq!(
+        identity_headers["x-patwari-stored-sha256"],
+        digest(&identity_original)
+    );
+
+    let (zstd_status, zstd_headers, zstd_downloaded) = call(
+        service.router(&config),
+        Request::builder()
+            .uri(&zstd.content_url)
+            .body(Body::empty())
+            .expect("zstd content request is valid"),
+    )
+    .await;
+    assert_eq!(zstd_status, StatusCode::OK);
+    assert_eq!(zstd_downloaded, zstd_stored);
+    assert_eq!(zstd_headers[header::CONTENT_ENCODING], "zstd");
+    assert_eq!(zstd_headers["x-patwari-compression"], "zstd");
+    assert_eq!(
+        zstd_headers["x-patwari-stored-size-bytes"],
+        zstd_stored.len().to_string()
+    );
+    assert_eq!(
+        zstd_headers["x-patwari-stored-sha256"],
+        digest(&zstd_stored)
+    );
+    assert_eq!(
+        zstd_headers["x-patwari-original-size-bytes"],
+        zstd_original.len().to_string()
+    );
+    assert_eq!(
+        zstd_headers["x-patwari-original-sha256"],
+        digest(&zstd_original)
+    );
+    assert_eq!(
+        zstd_headers["content-digest"],
+        format!("sha-256=:{}:", digest_base64(&zstd_stored))
+    );
+
+    let decoder =
+        zstd::stream::read::Decoder::new(&zstd_downloaded[..]).expect("stream decoder opens");
+    let (original_size, original_sha256) = digest_reader(decoder);
+    assert_eq!(original_size, zstd_original.len() as u64);
+    assert_eq!(original_sha256, digest(&zstd_original));
+}
+
+#[tokio::test]
+async fn large_artifact_download_is_backpressured_in_bounded_chunks() {
+    const MAX_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.chunk_size_bytes = MAX_STREAM_CHUNK_BYTES;
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = vec![b'x'; (MAX_STREAM_CHUNK_BYTES * 4) + 7];
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "large-streaming-download",
+        manifest(&bytes, &bytes, Compression::Identity),
+        &bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let snapshot = fetch_snapshot(&service, &config, &completion.receipt.snapshot_id).await;
+    let response = service
+        .router(&config)
+        .oneshot(
+            Request::builder()
+                .uri(&snapshot.artifacts[0].content_url)
+                .body(Body::empty())
+                .expect("content request is valid"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body = response.into_body();
+    let mut downloaded_size = 0_usize;
+    let mut downloaded_hasher = Sha256::new();
+    let mut data_frames = 0_usize;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("stream frame is valid");
+        if let Ok(data) = frame.into_data() {
+            assert!(
+                data.len() <= MAX_STREAM_CHUNK_BYTES,
+                "a streamed response frame must remain bounded"
+            );
+            downloaded_size += data.len();
+            downloaded_hasher.update(&data);
+            data_frames += 1;
+        }
+    }
+    assert_eq!(downloaded_size, bytes.len());
+    let downloaded_digest = downloaded_hasher.finalize();
+    let expected_digest = Sha256::digest(&bytes);
+    assert_eq!(&downloaded_digest[..], &expected_digest[..]);
+    assert!(
+        data_frames >= 4,
+        "large artifacts must be emitted over multiple backpressured frames"
+    );
+}
+
+#[tokio::test]
+async fn artifact_download_rejects_missing_corrupt_nonregular_and_drifted_storage() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"storage integrity fixture".repeat(100);
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "storage-integrity-download",
+        manifest(&bytes, &bytes, Compression::Identity),
+        &bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let snapshot = fetch_snapshot(&service, &config, &completion.receipt.snapshot_id).await;
+    let artifact = &snapshot.artifacts[0];
+    let blob_path = service.state.storage.blob_path(&digest_storage_hex(&bytes));
+
+    stdfs::remove_file(&blob_path).expect("remove canonical blob");
+    assert_artifact_integrity_failure(&service, &config, &artifact.content_url).await;
+
+    stdfs::write(&blob_path, &bytes).expect("restore canonical blob");
+    let mut corrupt = bytes.clone();
+    corrupt[0] ^= 1;
+    stdfs::write(&blob_path, &corrupt).expect("corrupt canonical blob");
+    assert_artifact_integrity_failure(&service, &config, &artifact.content_url).await;
+
+    stdfs::write(&blob_path, b"truncated").expect("truncate canonical blob");
+    assert_artifact_integrity_failure(&service, &config, &artifact.content_url).await;
+
+    stdfs::remove_file(&blob_path).expect("remove truncated blob");
+    stdfs::create_dir(&blob_path).expect("replace blob with a directory");
+    assert_artifact_integrity_failure(&service, &config, &artifact.content_url).await;
+
+    stdfs::remove_dir(&blob_path).expect("remove directory");
+    stdfs::write(&blob_path, &bytes).expect("restore canonical blob");
+    sqlx::query("UPDATE artifacts SET logical_path = 'drift.bin' WHERE id = ?1")
+        .bind(&artifact.artifact_id)
+        .execute(&service.state.database)
+        .await
+        .expect("induce artifact projection drift");
+    assert_artifact_integrity_failure(&service, &config, &artifact.content_url).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn artifact_download_rejects_blob_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"symlink storage integrity fixture";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "symlink-storage-integrity",
+        manifest(bytes, bytes, Compression::Identity),
+        bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let snapshot = fetch_snapshot(&service, &config, &completion.receipt.snapshot_id).await;
+    let blob_path = service.state.storage.blob_path(&digest_storage_hex(bytes));
+    let target = data_dir.0.join("symlink-target");
+    stdfs::write(&target, bytes).expect("write symlink target");
+    stdfs::remove_file(&blob_path).expect("remove canonical blob");
+    symlink(&target, &blob_path).expect("replace canonical blob with symlink");
+
+    assert_artifact_integrity_failure(&service, &config, &snapshot.artifacts[0].content_url).await;
+}
+
+#[tokio::test]
+async fn download_concurrency_limit_covers_unread_response_bodies() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.max_download_concurrency = 1;
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"concurrently bounded download\n".repeat(300);
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "download-concurrency",
+        manifest(&bytes, &bytes, Compression::Identity),
+        &bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let snapshot = fetch_snapshot(&service, &config, &completion.receipt.snapshot_id).await;
+    let content_url = snapshot.artifacts[0].content_url.clone();
+
+    let first = service
+        .router(&config)
+        .oneshot(
+            Request::builder()
+                .uri(&content_url)
+                .body(Body::empty())
+                .expect("first content request is valid"),
+        )
+        .await
+        .expect("first router response");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(service.state.download_permits.available_permits(), 0);
+
+    let mut second = Box::pin(
+        service.router(&config).oneshot(
+            Request::builder()
+                .uri(&content_url)
+                .body(Body::empty())
+                .expect("second content request is valid"),
+        ),
+    );
+    let second_was_ready = std::future::poll_fn(|context| {
+        Poll::Ready(matches!(second.as_mut().poll(context), Poll::Ready(_)))
+    })
+    .await;
+    assert!(
+        !second_was_ready,
+        "the second handler must wait for the response-body permit"
+    );
+
+    drop(first);
+    let second = second.await.expect("second router response");
+    assert_eq!(second.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn download_timeout_applies_after_streaming_response_is_created() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.request_timeout = Duration::from_secs(1);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"download timeout fixture\n".repeat(300);
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "download-timeout",
+        manifest(&bytes, &bytes, Compression::Identity),
+        &bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let snapshot = fetch_snapshot(&service, &config, &completion.receipt.snapshot_id).await;
+
+    let response = service
+        .router(&config)
+        .oneshot(
+            Request::builder()
+                .uri(&snapshot.artifacts[0].content_url)
+                .body(Body::empty())
+                .expect("content request is valid"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        service.state.download_permits.available_permits(),
+        config.max_download_concurrency - 1
+    );
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        response.into_body().collect().await.is_err(),
+        "the response body must enforce the configured download deadline"
+    );
+    assert_eq!(
+        service.state.download_permits.available_permits(),
+        config.max_download_concurrency
+    );
+}
+
+#[tokio::test]
+async fn verified_artifact_download_survives_restart() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let original = b"verified after restart\n".repeat(400);
+    let stored = zstd::stream::encode_all(&original[..], 1).expect("compresses");
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "verified-download-restart",
+        manifest(&original, &stored, Compression::Zstd),
+        &stored,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let snapshot = fetch_snapshot(&service, &config, &completion.receipt.snapshot_id).await;
+    let content_url = snapshot.artifacts[0].content_url.clone();
+    drop(service);
+
+    let (restarted, _) = Service::bootstrap(&config).await.expect("restarts");
+    let (status, headers, downloaded) = call(
+        restarted.router(&config),
+        Request::builder()
+            .uri(content_url)
+            .body(Body::empty())
+            .expect("content request is valid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(downloaded, stored);
+    assert_eq!(headers["x-patwari-original-sha256"], digest(&original));
+    let decoder = zstd::stream::read::Decoder::new(&downloaded[..]).expect("decoder opens");
+    assert_eq!(
+        digest_reader(decoder),
+        (original.len() as u64, digest(&original))
+    );
+}
+
+async fn assert_artifact_integrity_failure(service: &Service, config: &Config, content_url: &str) {
+    let (status, headers, body) = call(
+        service.router(config),
+        Request::builder()
+            .uri(content_url)
+            .body(Body::empty())
+            .expect("content request is valid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(headers.get("x-patwari-stored-sha256").is_none());
+    assert!(
+        String::from_utf8(body)
+            .expect("integrity error is utf-8")
+            .contains("artifact_integrity_failure")
+    );
 }

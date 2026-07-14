@@ -6,6 +6,7 @@ pub const DEFAULT_DATA_DIR: &str = "data";
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENCY: usize = 64;
+pub const DEFAULT_MAX_DOWNLOAD_CONCURRENCY: usize = 8;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_ARTIFACT_STORED_BYTES: u64 = 1024 * 1024 * 1024;
@@ -19,6 +20,7 @@ pub const MAX_CHUNK_COUNT: u64 = 65_536;
 const MIN_REQUEST_BODY_BYTES: usize = 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONCURRENCY: usize = 256;
+const MAX_DOWNLOAD_CONCURRENCY: usize = 64;
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 const MIN_CHUNK_SIZE_BYTES: usize = 1024;
 const MAX_CHUNK_SIZE_BYTES: usize = 32 * 1024 * 1024;
@@ -34,6 +36,7 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub max_request_body_bytes: usize,
     pub max_concurrency: usize,
+    pub max_download_concurrency: usize,
     pub request_timeout: Duration,
     pub chunk_size_bytes: usize,
     pub max_artifact_stored_bytes: u64,
@@ -54,6 +57,8 @@ pub enum ConfigError {
     InvalidRequestBodyLimit,
     #[error("PATWARI_MAX_CONCURRENCY must be between 1 and 256")]
     InvalidConcurrencyLimit,
+    #[error("PATWARI_MAX_DOWNLOAD_CONCURRENCY must be between 1 and 64")]
+    InvalidDownloadConcurrencyLimit,
     #[error("PATWARI_REQUEST_TIMEOUT must be a duration between 1s and 5m")]
     InvalidRequestTimeout,
     #[error("PATWARI_UPLOAD_CHUNK_SIZE_BYTES must be between 1024 and 33554432 bytes")]
@@ -85,6 +90,7 @@ impl Default for Config {
                 .expect("default bind address is valid"),
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            max_download_concurrency: DEFAULT_MAX_DOWNLOAD_CONCURRENCY,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             chunk_size_bytes: DEFAULT_CHUNK_SIZE_BYTES,
             max_artifact_stored_bytes: DEFAULT_MAX_ARTIFACT_STORED_BYTES,
@@ -149,6 +155,12 @@ impl Config {
         if let Some(value) = values.get("PATWARI_MAX_CONCURRENCY") {
             config.max_concurrency = parse_bounded_usize(value, 1, MAX_CONCURRENCY)
                 .ok_or(ConfigError::InvalidConcurrencyLimit)?;
+        }
+
+        if let Some(value) = values.get("PATWARI_MAX_DOWNLOAD_CONCURRENCY") {
+            config.max_download_concurrency =
+                parse_bounded_usize(value, 1, MAX_DOWNLOAD_CONCURRENCY)
+                    .ok_or(ConfigError::InvalidDownloadConcurrencyLimit)?;
         }
 
         if let Some(value) = values.get("PATWARI_REQUEST_TIMEOUT") {
@@ -223,6 +235,9 @@ impl Config {
         }
         if !(1..=MAX_CONCURRENCY).contains(&self.max_concurrency) {
             return Err(ConfigError::InvalidConcurrencyLimit);
+        }
+        if !(1..=MAX_DOWNLOAD_CONCURRENCY).contains(&self.max_download_concurrency) {
+            return Err(ConfigError::InvalidDownloadConcurrencyLimit);
         }
         if self.request_timeout.is_zero() || self.request_timeout > MAX_REQUEST_TIMEOUT {
             return Err(ConfigError::InvalidRequestTimeout);
@@ -319,6 +334,7 @@ mod tests {
         assert!(config.bind_addr.ip().is_loopback());
         assert_eq!(config.max_request_body_bytes, 32 * 1024 * 1024);
         assert_eq!(config.max_concurrency, 64);
+        assert_eq!(config.max_download_concurrency, 8);
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.chunk_size_bytes, 4 * 1024 * 1024);
         assert_eq!(config.max_artifact_count, 128);
@@ -339,6 +355,7 @@ mod tests {
             ("PATWARI_MAX_SNAPSHOT_STORED_BYTES".into(), "8192".into()),
             ("PATWARI_MAX_SNAPSHOT_ORIGINAL_BYTES".into(), "16384".into()),
             ("PATWARI_MAX_CONCURRENCY".into(), "2".into()),
+            ("PATWARI_MAX_DOWNLOAD_CONCURRENCY".into(), "1".into()),
             ("PATWARI_REQUEST_TIMEOUT".into(), "5s".into()),
             ("PATWARI_UPLOAD_EXPIRY".into(), "2h".into()),
         ]);
@@ -353,6 +370,7 @@ mod tests {
         assert_eq!(config.max_snapshot_stored_bytes, 8192);
         assert_eq!(config.max_snapshot_original_bytes, 16384);
         assert_eq!(config.max_concurrency, 2);
+        assert_eq!(config.max_download_concurrency, 1);
         assert_eq!(config.request_timeout, Duration::from_secs(5));
         assert_eq!(config.upload_expiry, Duration::from_hours(2));
     }
@@ -362,6 +380,11 @@ mod tests {
         let values = HashMap::from([("PATWARI_MAX_CONCURRENCY".into(), "0".into())]);
         let error = Config::from_values(&values).expect_err("zero concurrency is not a safe limit");
         assert_eq!(error, ConfigError::InvalidConcurrencyLimit);
+
+        let values = HashMap::from([("PATWARI_MAX_DOWNLOAD_CONCURRENCY".into(), "0".into())]);
+        let error =
+            Config::from_values(&values).expect_err("zero download concurrency is not safe");
+        assert_eq!(error, ConfigError::InvalidDownloadConcurrencyLimit);
 
         let values = HashMap::from([
             ("PATWARI_UPLOAD_CHUNK_SIZE_BYTES".into(), "8192".into()),

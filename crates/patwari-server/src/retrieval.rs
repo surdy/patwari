@@ -1,20 +1,40 @@
 //! Read-only archive browsing resources and their stable pagination rules.
 
-use std::{fmt::Write, path::Path, sync::Arc};
+use std::{
+    fmt::Write,
+    future::Future,
+    io,
+    path::Path,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, Query, State, rejection::QueryRejection},
     http::{HeaderValue, header},
     response::{IntoResponse, Response},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
-use tokio::fs;
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    sync::OwnedSemaphorePermit,
+    time::{Instant, Sleep},
+};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -48,6 +68,7 @@ const CAPTURE_CURSOR_KIND: &str = "captures";
 const SNAPSHOT_CURSOR_KIND: &str = "snapshots";
 const MANIFEST_CURSOR_KIND: &str = "manifests";
 const ARTIFACT_CURSOR_KIND: &str = "artifacts";
+const DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1727,47 +1748,349 @@ pub(crate) async fn download_artifact(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, ApiError> {
     let artifact_id = parse_uuid(&artifact_id, "artifact identifier is not a UUID")?.to_string();
-    let row = sqlx::query_as::<_, DownloadRow>(
-        "SELECT b.stored_sha256, b.stored_size_bytes
-         FROM artifacts a
-         JOIN snapshots s ON s.id = a.snapshot_id
-         JOIN blobs b ON b.id = a.blob_id
-         WHERE a.id = ? AND s.deleted_at IS NULL",
-    )
-    .bind(&artifact_id)
-    .fetch_optional(&state.database)
-    .await
-    .map_err(|_| ApiError::database())?
-    .ok_or_else(|| ApiError::not_found("artifact_not_found", "artifact was not found"))?;
-    let path = state.storage.blob_path(&row.stored_sha256);
-    if !is_regular_file(&path).await {
-        return Err(ApiError::storage());
-    }
-    let file = fs::File::open(path)
+    let download_deadline = Instant::now() + state.download_timeout;
+    let permit = state
+        .download_permits
+        .clone()
+        .acquire_owned()
         .await
-        .map_err(|_| ApiError::storage())?;
-    let size = u64::try_from(row.stored_size_bytes).map_err(|_| ApiError::internal())?;
-    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&size.to_string()).map_err(|_| ApiError::internal())?,
-    );
-    response.headers_mut().insert(
-        "x-patwari-stored-sha256",
-        HeaderValue::from_str(&digest_document_value(&row.stored_sha256))
-            .map_err(|_| ApiError::internal())?,
-    );
+        .map_err(|_| ApiError::internal())?;
+    let metadata = verified_download_metadata(&state.database, &artifact_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("artifact_not_found", "artifact was not found"))?;
+    let path = state.storage.blob_path(&metadata.stored_sha256);
+    let (file, stored_digest_base64) =
+        preflight_blob(&path, metadata.stored_size_bytes, &metadata.stored_sha256).await?;
+    let stream = VerifiedDownloadStream::new(file, download_deadline, permit);
+    let mut response = Response::new(Body::from_stream(stream));
+    add_download_headers(&mut response, &metadata, &stored_digest_base64)?;
     Ok(response)
 }
 
-async fn is_regular_file(path: &Path) -> bool {
-    fs::metadata(path)
+async fn verified_download_metadata(
+    database: &SqlitePool,
+    artifact_id: &str,
+) -> Result<Option<DownloadMetadata>, ApiError> {
+    let row = sqlx::query_as::<_, DownloadRow>(
+        "SELECT a.snapshot_id, a.artifact_index, a.logical_path, a.media_type, a.original_size_bytes,
+                a.original_sha256, b.stored_size_bytes, b.stored_sha256, b.compression,
+                m.canonical_json, m.sha256 AS manifest_sha256
+         FROM artifacts a
+         JOIN snapshots s ON s.id = a.snapshot_id
+         JOIN manifests m ON m.id = s.manifest_id
+         JOIN blobs b ON b.id = a.blob_id
+         WHERE a.id = ?1 AND s.deleted_at IS NULL",
+    )
+    .bind(artifact_id)
+    .fetch_optional(database)
+    .await
+    .map_err(|_| ApiError::database())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let snapshot_id = row.snapshot_id.clone();
+    let metadata = download_metadata_from_row(&row)?;
+    ingestion::reconcile_snapshot(database, &snapshot_id)
         .await
-        .is_ok_and(|metadata| metadata.is_file())
+        .map_err(|error| match error {
+            ingestion::ReconciliationError::Metadata => ApiError::database(),
+            ingestion::ReconciliationError::NotFound | ingestion::ReconciliationError::Drift => {
+                ApiError::artifact_integrity()
+            }
+        })?;
+    Ok(Some(metadata))
+}
+
+fn download_metadata_from_row(row: &DownloadRow) -> Result<DownloadMetadata, ApiError> {
+    if sha256_hex(row.canonical_json.as_bytes()) != row.manifest_sha256 {
+        return Err(ApiError::artifact_integrity());
+    }
+    let manifest: Manifest =
+        serde_json::from_str(&row.canonical_json).map_err(|_| ApiError::artifact_integrity())?;
+    let artifact_index =
+        usize::try_from(row.artifact_index).map_err(|_| ApiError::artifact_integrity())?;
+    let artifact = manifest
+        .artifacts
+        .get(artifact_index)
+        .ok_or_else(ApiError::artifact_integrity)?;
+    let original_sha256 =
+        canonical_digest(&artifact.original_sha256).ok_or_else(ApiError::artifact_integrity)?;
+    let stored_sha256 =
+        canonical_digest(&artifact.stored_sha256).ok_or_else(ApiError::artifact_integrity)?;
+    let original_size_bytes =
+        u64::try_from(row.original_size_bytes).map_err(|_| ApiError::artifact_integrity())?;
+    let stored_size_bytes =
+        u64::try_from(row.stored_size_bytes).map_err(|_| ApiError::artifact_integrity())?;
+    let compression =
+        parse_compression(&row.compression).map_err(|()| ApiError::artifact_integrity())?;
+
+    if row.logical_path != artifact.logical_path
+        || row.media_type != artifact.media_type
+        || original_size_bytes != artifact.original_size_bytes
+        || storage_digest(&row.original_sha256) != Some(original_sha256)
+        || stored_size_bytes != artifact.stored_size_bytes
+        || storage_digest(&row.stored_sha256) != Some(stored_sha256)
+        || compression != artifact.compression
+    {
+        return Err(ApiError::artifact_integrity());
+    }
+
+    Ok(DownloadMetadata {
+        logical_path: artifact.logical_path.clone(),
+        media_type: artifact.media_type.clone(),
+        original_size_bytes: artifact.original_size_bytes,
+        original_sha256: digest_document_value(original_sha256),
+        stored_size_bytes: artifact.stored_size_bytes,
+        stored_sha256: stored_sha256.to_owned(),
+        compression: artifact.compression,
+    })
+}
+
+fn add_download_headers(
+    response: &mut Response,
+    metadata: &DownloadMetadata,
+    stored_digest_base64: &str,
+) -> Result<(), ApiError> {
+    let headers = response.headers_mut();
+    if let Some(media_type) = &metadata.media_type {
+        media_type
+            .parse::<mime::Mime>()
+            .map_err(|_| ApiError::artifact_integrity())?;
+    }
+    let media_type = metadata
+        .media_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    headers.insert(header::CONTENT_TYPE, header_value(media_type)?);
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header_value(&metadata.stored_size_bytes.to_string())?,
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-transform"),
+    );
+    if metadata.compression == Compression::Zstd {
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+    }
+    headers.insert(
+        "digest",
+        header_value(&format!("SHA-256={stored_digest_base64}"))?,
+    );
+    headers.insert(
+        "content-digest",
+        header_value(&format!("sha-256=:{stored_digest_base64}:"))?,
+    );
+    headers.insert(
+        "x-patwari-logical-path",
+        header_value(&URL_SAFE_NO_PAD.encode(metadata.logical_path.as_bytes()))?,
+    );
+    headers.insert(
+        "x-patwari-logical-path-encoding",
+        HeaderValue::from_static("base64url"),
+    );
+    if let Some(media_type) = &metadata.media_type {
+        headers.insert("x-patwari-media-type", header_value(media_type)?);
+    }
+    headers.insert(
+        "x-patwari-compression",
+        HeaderValue::from_static(match metadata.compression {
+            Compression::Identity => "identity",
+            Compression::Zstd => "zstd",
+        }),
+    );
+    headers.insert(
+        "x-patwari-original-size-bytes",
+        header_value(&metadata.original_size_bytes.to_string())?,
+    );
+    headers.insert(
+        "x-patwari-original-sha256",
+        header_value(&metadata.original_sha256)?,
+    );
+    headers.insert(
+        "x-patwari-stored-size-bytes",
+        header_value(&metadata.stored_size_bytes.to_string())?,
+    );
+    headers.insert(
+        "x-patwari-stored-sha256",
+        header_value(&digest_document_value(&metadata.stored_sha256))?,
+    );
+    Ok(())
+}
+
+fn header_value(value: &str) -> Result<HeaderValue, ApiError> {
+    HeaderValue::from_str(value).map_err(|_| ApiError::artifact_integrity())
+}
+
+async fn preflight_blob(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(fs::File, String), ApiError> {
+    if storage_digest(expected_sha256).is_none() {
+        return Err(ApiError::artifact_integrity());
+    }
+    let path_metadata = fs::symlink_metadata(path)
+        .await
+        .map_err(|_| ApiError::artifact_integrity())?;
+    if !path_metadata.file_type().is_file() {
+        return Err(ApiError::artifact_integrity());
+    }
+
+    let mut file = open_blob_without_following_symlinks(path)
+        .await
+        .map_err(|_| ApiError::artifact_integrity())?;
+    let before = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError::artifact_integrity())?;
+    if !before.is_file() || before.len() != expected_size {
+        return Err(ApiError::artifact_integrity());
+    }
+
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|_| ApiError::artifact_integrity())?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(|_| ApiError::artifact_integrity())?)
+            .ok_or_else(ApiError::artifact_integrity)?;
+        if total > expected_size {
+            return Err(ApiError::artifact_integrity());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let actual_sha256 = hex_digest(digest);
+    let after = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError::artifact_integrity())?;
+    if total != expected_size
+        || actual_sha256 != expected_sha256
+        || metadata_changed_during_preflight(&before, &after)
+    {
+        return Err(ApiError::artifact_integrity());
+    }
+    file.seek(SeekFrom::Start(0))
+        .await
+        .map_err(|_| ApiError::artifact_integrity())?;
+    Ok((file, STANDARD.encode(&digest[..])))
+}
+
+async fn open_blob_without_following_symlinks(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path).await
+}
+
+fn metadata_changed_during_preflight(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> bool {
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn storage_digest(value: &str) -> Option<&str> {
+    (value.len() == 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        }))
+    .then_some(value)
+}
+
+fn canonical_digest(value: &str) -> Option<&str> {
+    value.strip_prefix("sha256:").and_then(storage_digest)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_digest(Sha256::digest(bytes))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = digest.as_ref();
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    value
+}
+
+/// Keeps the download permit until the client finishes, errors, times out,
+/// or drops the body. `ReaderStream` pulls at most one fixed-size chunk per
+/// poll, so downstream HTTP backpressure bounds the in-memory payload.
+struct VerifiedDownloadStream {
+    reader: ReaderStream<fs::File>,
+    deadline: Pin<Box<Sleep>>,
+    permit: Option<OwnedSemaphorePermit>,
+    timed_out: bool,
+}
+
+impl VerifiedDownloadStream {
+    fn new(file: fs::File, deadline: Instant, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            reader: ReaderStream::with_capacity(file, DOWNLOAD_BUFFER_BYTES),
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+            permit: Some(permit),
+            timed_out: false,
+        }
+    }
+}
+
+impl Stream for VerifiedDownloadStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let stream = self.as_mut().get_mut();
+        if stream.timed_out {
+            return Poll::Ready(None);
+        }
+        if stream.deadline.as_mut().poll(context).is_ready() {
+            stream.timed_out = true;
+            stream.permit.take();
+            return Poll::Ready(Some(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "artifact download exceeded the configured time limit",
+            ))));
+        }
+        match Pin::new(&mut stream.reader).poll_next(context) {
+            Poll::Ready(None) => {
+                stream.permit.take();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                stream.permit.take();
+                Poll::Ready(Some(Err(error)))
+            }
+            result => result,
+        }
+    }
 }
 
 pub(crate) async fn completion_for_upload(
@@ -1938,8 +2261,28 @@ struct ArtifactMetadataRow {
 
 #[derive(FromRow)]
 struct DownloadRow {
+    snapshot_id: String,
+    artifact_index: i64,
+    logical_path: String,
+    media_type: Option<String>,
+    original_size_bytes: i64,
+    original_sha256: String,
     stored_sha256: String,
     stored_size_bytes: i64,
+    compression: String,
+    canonical_json: String,
+    manifest_sha256: String,
+}
+
+struct DownloadMetadata {
+    logical_path: String,
+    media_type: Option<String>,
+    original_size_bytes: u64,
+    original_sha256: String,
+    stored_size_bytes: u64,
+    /// Stored as bare lowercase hexadecimal to match the blob pathname.
+    stored_sha256: String,
+    compression: Compression,
 }
 
 #[derive(FromRow)]

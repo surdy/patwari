@@ -55,6 +55,18 @@ impl ApiError {
         )
     }
 
+    /// The artifact exists in archival metadata but cannot be proven to match
+    /// its immutable manifest and blob contract. This deliberately differs
+    /// from a missing artifact so clients never mistake corrupted storage for
+    /// an empty or partial successful download.
+    pub(crate) const fn artifact_integrity() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "artifact_integrity_failure",
+            "artifact integrity verification failed",
+        )
+    }
+
     pub(crate) const fn database() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

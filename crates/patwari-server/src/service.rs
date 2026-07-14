@@ -7,7 +7,7 @@ use axum::{
 };
 use sqlx::SqlitePool;
 use thiserror::Error;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tower::{ServiceBuilder, timeout::TimeoutLayer};
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -59,6 +59,12 @@ pub(crate) struct AppState {
     pub(crate) max_snapshot_stored_bytes: u64,
     pub(crate) max_snapshot_original_bytes: u64,
     pub(crate) upload_expiry: std::time::Duration,
+    /// Held by each response body, rather than only by its request handler,
+    /// so the cap covers clients that read slowly or stop reading entirely.
+    pub(crate) download_permits: Arc<Semaphore>,
+    /// Tower's request timeout ends once a streaming response is constructed;
+    /// the download stream finishes that same deadline after headers are sent.
+    pub(crate) download_timeout: std::time::Duration,
     upload_locks: [Arc<AsyncMutex<()>>; UPLOAD_LOCK_STRIPES],
     blob_locks: [Arc<AsyncMutex<()>>; BLOB_LOCK_STRIPES],
     #[cfg(test)]
@@ -288,6 +294,8 @@ impl Service {
             max_snapshot_stored_bytes: config.max_snapshot_stored_bytes,
             max_snapshot_original_bytes: config.max_snapshot_original_bytes,
             upload_expiry: config.upload_expiry,
+            download_permits: Arc::new(Semaphore::new(config.max_download_concurrency)),
+            download_timeout: config.request_timeout,
             upload_locks: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
             blob_locks: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
             #[cfg(test)]
