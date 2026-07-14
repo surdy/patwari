@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     error_handling::HandleErrorLayer,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use sqlx::SqlitePool;
 use thiserror::Error;
@@ -18,7 +18,7 @@ use tracing::Level;
 use crate::{
     config::{Config, ConfigError},
     database::{self},
-    health, ingestion, retrieval,
+    deletion, health, ingestion, retrieval,
     storage::StorageLayout,
 };
 
@@ -27,9 +27,9 @@ pub use crate::ingestion::ReconciliationError;
 
 #[derive(Debug, Error)]
 pub enum MaintenanceError {
-    #[error("upload maintenance could not obtain a server timestamp")]
+    #[error("archive maintenance could not obtain a server timestamp")]
     Clock,
-    #[error("upload maintenance could not complete")]
+    #[error("archive maintenance could not complete")]
     Operation,
 }
 
@@ -39,6 +39,12 @@ pub enum MaintenanceError {
 /// are created over the life of the process (unlike a map keyed by upload
 /// ID, which would grow without bound).
 pub(crate) const UPLOAD_LOCK_STRIPES: usize = 256;
+
+/// Number of fixed lock stripes that serialize deletion against completion
+/// coalescence for a session-scoped semantic snapshot identity. A completion
+/// that finds a live fingerprint takes this lock before attaching capture
+/// provenance, so deletion cannot tombstone that snapshot mid-attachment.
+pub(crate) const SNAPSHOT_LOCK_STRIPES: usize = 256;
 
 /// Number of fixed lock stripes used to serialize every operation that
 /// promotes, verifies/reuses, creates or references, or conditionally
@@ -59,6 +65,8 @@ pub(crate) struct AppState {
     pub(crate) max_snapshot_stored_bytes: u64,
     pub(crate) max_snapshot_original_bytes: u64,
     pub(crate) upload_expiry: std::time::Duration,
+    pub(crate) admin_deletion_enabled: bool,
+    pub(crate) blob_gc_grace: std::time::Duration,
     /// Held by each response body, rather than only by its request handler,
     /// so the cap covers clients that read slowly or stop reading entirely.
     pub(crate) download_permits: Arc<Semaphore>,
@@ -66,6 +74,7 @@ pub(crate) struct AppState {
     /// the download stream finishes that same deadline after headers are sent.
     pub(crate) download_timeout: std::time::Duration,
     upload_locks: [Arc<AsyncMutex<()>>; UPLOAD_LOCK_STRIPES],
+    snapshot_locks: [Arc<AsyncMutex<()>>; SNAPSHOT_LOCK_STRIPES],
     blob_locks: [Arc<AsyncMutex<()>>; BLOB_LOCK_STRIPES],
     #[cfg(test)]
     pub(crate) test_hooks: TestHooks,
@@ -97,6 +106,14 @@ pub(crate) struct TestHooks {
     /// assertion is not confounded by the third party simply not having
     /// been scheduled yet.
     before_blob_lock_attempt: std::sync::Mutex<Option<Arc<Checkpoint>>>,
+    /// Paused before a completion acquires its first digest lock. Lets a test
+    /// land GC between a tombstone's committed orphan candidate and a
+    /// rearchive's file promotion.
+    before_blob_lock_acquire: std::sync::Mutex<Option<Arc<Checkpoint>>>,
+    /// Paused after a deletion transaction has removed Artifact
+    /// relationships but before it commits the Tombstone and projection
+    /// update. Lets a test force completion to observe the post-delete state.
+    before_snapshot_deletion_commit: std::sync::Mutex<Option<Arc<Checkpoint>>>,
 }
 
 #[cfg(test)]
@@ -145,6 +162,34 @@ impl TestHooks {
 
     pub(crate) fn before_blob_lock_attempt(&self) -> Option<Arc<Checkpoint>> {
         self.before_blob_lock_attempt
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .clone()
+    }
+
+    pub(crate) fn set_before_blob_lock_acquire(&self, checkpoint: Arc<Checkpoint>) {
+        *self
+            .before_blob_lock_acquire
+            .lock()
+            .expect("test hook mutex is not poisoned") = Some(checkpoint);
+    }
+
+    pub(crate) fn before_blob_lock_acquire(&self) -> Option<Arc<Checkpoint>> {
+        self.before_blob_lock_acquire
+            .lock()
+            .expect("test hook mutex is not poisoned")
+            .clone()
+    }
+
+    pub(crate) fn set_before_snapshot_deletion_commit(&self, checkpoint: Arc<Checkpoint>) {
+        *self
+            .before_snapshot_deletion_commit
+            .lock()
+            .expect("test hook mutex is not poisoned") = Some(checkpoint);
+    }
+
+    pub(crate) fn before_snapshot_deletion_commit(&self) -> Option<Arc<Checkpoint>> {
+        self.before_snapshot_deletion_commit
             .lock()
             .expect("test hook mutex is not poisoned")
             .clone()
@@ -201,6 +246,17 @@ impl AppState {
         self.upload_locks[upload_lock_stripe(upload_id)].clone()
     }
 
+    /// Returns the fixed lock stripe for a session-scoped semantic snapshot
+    /// identity. This closes the completion/deletion race without retaining a
+    /// lock per historical fingerprint.
+    pub(crate) fn snapshot_lock(
+        &self,
+        session_id: &str,
+        fingerprint_sha256: &str,
+    ) -> Arc<AsyncMutex<()>> {
+        self.snapshot_locks[snapshot_lock_stripe(session_id, fingerprint_sha256)].clone()
+    }
+
     /// Returns each lock stripe needed for a set of blob digests exactly once,
     /// in ascending deterministic order. Acquiring a mutex once per digest
     /// could recursively acquire the same collision stripe, while a common
@@ -236,33 +292,50 @@ fn upload_lock_stripe(upload_id: &str) -> usize {
     usize::try_from(hash % UPLOAD_LOCK_STRIPES as u64).unwrap_or(0)
 }
 
+fn snapshot_lock_stripe(session_id: &str, fingerprint_sha256: &str) -> usize {
+    stable_lock_stripe(
+        session_id
+            .as_bytes()
+            .iter()
+            .chain(std::iter::once(&0_u8))
+            .chain(fingerprint_sha256.as_bytes()),
+        SNAPSHOT_LOCK_STRIPES,
+    )
+}
+
 /// Deterministically hashes `owner_namespace` and `stored_sha256` (the
 /// caller must pass the bare hex digest, without a `sha256:` prefix, so that
 /// prefixed and unprefixed callers agree on a stripe) onto a fixed stripe
 /// index using FNV-1a, independent of process-specific hasher randomization.
 ///
-/// Lock ordering: every code path that needs both an upload lock and a blob
-/// lock acquires the upload lock first, then the blob lock, and releases the
-/// blob lock before or when it releases the upload lock. No path acquires a
-/// blob lock and then waits on an upload lock, so the two lock families
-/// cannot deadlock against each other. A `SQLite` transaction may be opened,
-/// committed, rolled back, and followed by conditional cleanup while holding
-/// blob locks; no transaction is ever left open while waiting to acquire a
-/// blob lock.
+/// Where a path needs more than one family, its ordering is upload -> semantic
+/// snapshot -> blob. Deletion takes semantic snapshot -> blob, and GC takes
+/// only blob locks; completion's new-snapshot path needs only upload -> blob.
+/// No code path waits on an earlier family after acquiring a later one, so
+/// completion, deletion, and GC cannot cycle. A `SQLite` transaction may be
+/// opened, committed, rolled back, and followed by conditional cleanup while
+/// holding blob locks; no transaction is ever left open while waiting to
+/// acquire a blob lock.
 fn blob_lock_stripe(owner_namespace: &str, stored_sha256: &str) -> usize {
+    stable_lock_stripe(
+        owner_namespace
+            .as_bytes()
+            .iter()
+            .chain(std::iter::once(&0_u8))
+            .chain(stored_sha256.as_bytes()),
+        BLOB_LOCK_STRIPES,
+    )
+}
+
+fn stable_lock_stripe<'a>(bytes: impl Iterator<Item = &'a u8>, stripe_count: usize) -> usize {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET_BASIS;
-    for byte in owner_namespace
-        .as_bytes()
-        .iter()
-        .chain(std::iter::once(&0_u8))
-        .chain(stored_sha256.as_bytes())
-    {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    usize::try_from(hash % BLOB_LOCK_STRIPES as u64).unwrap_or(0)
+    usize::try_from(hash % stripe_count as u64).unwrap_or(0)
 }
 
 pub struct Service {
@@ -294,9 +367,12 @@ impl Service {
             max_snapshot_stored_bytes: config.max_snapshot_stored_bytes,
             max_snapshot_original_bytes: config.max_snapshot_original_bytes,
             upload_expiry: config.upload_expiry,
+            admin_deletion_enabled: config.admin_deletion_enabled,
+            blob_gc_grace: config.blob_gc_grace,
             download_permits: Arc::new(Semaphore::new(config.max_download_concurrency)),
             download_timeout: config.request_timeout,
             upload_locks: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
+            snapshot_locks: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
             blob_locks: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
             #[cfg(test)]
             test_hooks: TestHooks::default(),
@@ -375,6 +451,16 @@ impl Service {
                 "/artifacts/{artifact_id}/content",
                 get(retrieval::download_artifact),
             )
+            .route(
+                "/admin/snapshots/{snapshot_id}",
+                delete(deletion::delete_snapshot),
+            )
+            .route("/admin/tombstones", get(deletion::list_tombstones))
+            .route(
+                "/admin/tombstones/{snapshot_id}",
+                get(deletion::get_tombstone),
+            )
+            .route("/admin/blob-gc", post(deletion::run_blob_gc))
             .fallback(health::api_not_found)
             .layer(
                 ServiceBuilder::new()
@@ -422,6 +508,20 @@ impl Service {
     /// cannot be read, or its normalized metadata has drifted from it.
     pub async fn reconcile_snapshot(&self, snapshot_id: &str) -> Result<(), ReconciliationError> {
         ingestion::reconcile_snapshot(&self.state.database, snapshot_id).await
+    }
+
+    /// Runs one trusted-operator blob-GC pass. It is safe to call while the
+    /// server is serving requests: each candidate is rechecked against live
+    /// relationship rows under its deterministic digest lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when metadata or blob storage cannot be safely
+    /// reconciled and removed.
+    pub async fn collect_blob_garbage(
+        &self,
+    ) -> Result<crate::contract::BlobGcResponse, MaintenanceError> {
+        deletion::collect_orphaned_blobs_at(&self.state, time::OffsetDateTime::now_utc()).await
     }
 
     #[cfg(test)]

@@ -1320,27 +1320,37 @@ pub(crate) async fn complete_upload(
         return Err(error);
     }
 
-    // Fully verify every stored and original stream before deciding semantic
-    // deduplication. A duplicate snapshot cannot be used to mask a corrupt
-    // or incomplete artifact.
+    // A fast semantic hit must take the same identity lock as deletion before
+    // committing capture provenance. If deletion wins while this request is
+    // preparing, the guarded recheck falls through to a distinct rearchive.
     if let Some(snapshot_id) =
         find_snapshot_by_fingerprint(&state, &upload.session_id, &fingerprint).await?
     {
-        cleanup_prepared(&prepared).await;
-        finalize_upload_for_existing_snapshot(
-            &state,
-            &upload,
-            &manifest,
-            &snapshot_id,
-            transfer_bytes,
-        )
-        .await?;
-        let _ = state.storage.remove_upload_dir(&upload_id).await;
-        return crate::retrieval::completion_for_upload(&state, &upload_id)
-            .await
-            .map(Json);
+        let snapshot_lock = state.snapshot_lock(&upload.session_id, &fingerprint);
+        let _snapshot_guard = snapshot_lock.lock_owned().await;
+        if let Some(live_snapshot_id) =
+            find_snapshot_by_fingerprint(&state, &upload.session_id, &fingerprint).await?
+        {
+            debug_assert_eq!(snapshot_id, live_snapshot_id);
+            cleanup_prepared(&prepared).await;
+            finalize_upload_for_existing_snapshot(
+                &state,
+                &upload,
+                &manifest,
+                &live_snapshot_id,
+                transfer_bytes,
+            )
+            .await?;
+            let _ = state.storage.remove_upload_dir(&upload_id).await;
+            return crate::retrieval::completion_for_upload(&state, &upload_id)
+                .await
+                .map(Json);
+        }
     }
 
+    // Fully verify every stored and original stream before deciding storage
+    // deduplication. A duplicate snapshot cannot be used to mask a corrupt
+    // or incomplete artifact.
     let unique = unique_stored_artifacts(&prepared);
     let digests = unique
         .iter()
@@ -1708,10 +1718,16 @@ async fn acquire_blob_locks(state: &AppState, digests: &[String]) -> Vec<OwnedMu
     let mut guards = Vec::with_capacity(locks.len());
     #[cfg(test)]
     let mut first_lock_checkpoint = state.test_hooks.before_blob_lock_attempt();
+    #[cfg(test)]
+    let mut first_acquire_checkpoint = state.test_hooks.before_blob_lock_acquire();
     for lock in locks {
         #[cfg(test)]
         if let Some(checkpoint) = first_lock_checkpoint.take() {
             checkpoint.mark_reached();
+        }
+        #[cfg(test)]
+        if let Some(checkpoint) = first_acquire_checkpoint.take() {
+            checkpoint.arrive_and_wait().await;
         }
         guards.push(lock.lock_owned().await);
     }
@@ -1771,7 +1787,8 @@ async fn find_snapshot_by_fingerprint(
     fingerprint: &str,
 ) -> Result<Option<String>, ApiError> {
     let row: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM snapshots WHERE session_id = ?1 AND fingerprint_sha256 = ?2",
+        "SELECT id FROM snapshots
+         WHERE session_id = ?1 AND fingerprint_sha256 = ?2 AND deleted_at IS NULL",
     )
     .bind(session_id)
     .bind(fingerprint)
@@ -1794,6 +1811,22 @@ async fn finalize_upload_for_existing_snapshot(
         .begin()
         .await
         .map_err(|error| classify_database_error(&error))?;
+    let live_snapshot: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM snapshots WHERE id = ?1 AND deleted_at IS NULL")
+            .bind(snapshot_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| ApiError::database())?;
+    if live_snapshot.is_none() {
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| classify_database_error(&error))?;
+        return Err(ApiError::conflict(
+            "snapshot_deleted",
+            "snapshot was deleted before capture provenance could be recorded",
+        ));
+    }
     let updated = sqlx::query(
         "UPDATE uploads
          SET status = 'completed', snapshot_id = ?1, completed_at = ?2,
@@ -1853,7 +1886,7 @@ async fn finalize_upload_for_existing_snapshot(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn record_completed_upload(
     state: &AppState,
     upload_id: &str,
@@ -1892,15 +1925,30 @@ async fn record_completed_upload(
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| ApiError::database())?;
+    // A live fingerprint cannot coexist with this completion (the partial
+    // unique index enforces that). If an identical historical snapshot was
+    // deleted, carry that durable deletion identity forward rather than
+    // reviving its ID.
+    let prior_tombstone: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM tombstones
+         WHERE session_id = ?1 AND snapshot_fingerprint_sha256 = ?2
+         ORDER BY deleted_at_seq DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(&upload.session_id)
+    .bind(fingerprint)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| ApiError::database())?;
     let (total_original_bytes, total_stored_bytes) = manifest_totals(manifest)?;
     let candidate_snapshot_id = Uuid::now_v7().to_string();
     let snapshot_insert = sqlx::query(
         "INSERT INTO snapshots (
             id, owner_namespace, session_id, manifest_id, fingerprint_sha256, completed_at,
             completed_at_seq, artifact_count, total_original_size_bytes, total_stored_size_bytes,
-            fingerprint_version
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-         ON CONFLICT(session_id, fingerprint_sha256) DO NOTHING",
+            fingerprint_version, rearchived_from_tombstone_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT DO NOTHING",
     )
     .bind(&candidate_snapshot_id)
     .bind(&state.identity.owner_namespace)
@@ -1915,6 +1963,7 @@ async fn record_completed_upload(
     .bind(to_sqlite_i64(total_original_bytes)?)
     .bind(to_sqlite_i64(total_stored_bytes)?)
     .bind(SNAPSHOT_FINGERPRINT_VERSION)
+    .bind(prior_tombstone.as_ref().map(|row| &row.0))
     .execute(&mut *transaction)
     .await
     .map_err(|_| ApiError::database())?;
@@ -1929,7 +1978,8 @@ async fn record_completed_upload(
             checkpoint.arrive_and_wait().await;
         }
         let winner: (String,) = sqlx::query_as(
-            "SELECT id FROM snapshots WHERE session_id = ?1 AND fingerprint_sha256 = ?2",
+            "SELECT id FROM snapshots
+             WHERE session_id = ?1 AND fingerprint_sha256 = ?2 AND deleted_at IS NULL",
         )
         .bind(&upload.session_id)
         .bind(fingerprint)
@@ -1957,6 +2007,18 @@ async fn record_completed_upload(
         newly_persisted_bytes,
     )
     .await?;
+    if let Some((tombstone_id,)) = prior_tombstone {
+        sqlx::query(
+            "UPDATE tombstones
+             SET rearchived_snapshot_id = ?1
+             WHERE id = ?2 AND rearchived_snapshot_id IS NULL",
+        )
+        .bind(&candidate_snapshot_id)
+        .bind(tombstone_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ApiError::database())?;
+    }
     transaction
         .commit()
         .await
@@ -2293,6 +2355,19 @@ async fn get_or_create_blob(
     {
         return Err(blob_integrity_conflict());
     }
+    // Relationship rows, not this candidate state, authorize GC. Clear a
+    // pending candidate in the same transaction that is about to create a
+    // live Artifact reference so a rearchive cannot inherit an old grace
+    // deadline.
+    sqlx::query(
+        "UPDATE blobs
+         SET orphaned_at = NULL, eligible_after = NULL, eligible_after_seq = NULL
+         WHERE id = ?1",
+    )
+    .bind(&row.id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::database())?;
     Ok(row.id)
 }
 
@@ -3228,6 +3303,20 @@ async fn upgrade_legacy_upload(
         .begin()
         .await
         .map_err(|_| MaintenanceError::Operation)?;
+    // Versions that carried only the pre-deletion `deleted_at` visibility
+    // hook can contain historical Artifact rows for an already tombstoned
+    // snapshot. They are not live relationships and must not keep a blob
+    // metadata row foreign-key-pinned forever.
+    sqlx::query(
+        "DELETE FROM artifacts
+         WHERE EXISTS (
+             SELECT 1 FROM snapshots snapshot
+             WHERE snapshot.id = artifacts.snapshot_id AND snapshot.deleted_at IS NOT NULL
+         )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
     sqlx::query(
         "UPDATE uploads SET
             chunk_size_bytes = ?1, chunk_count = ?2, declared_stored_size_bytes = ?3,
@@ -3462,37 +3551,54 @@ async fn recover_artifact_chunks(
 }
 
 async fn recover_unreferenced_blobs(state: &AppState) -> Result<(), MaintenanceError> {
-    let unreferenced = sqlx::query_as::<_, OrphanedBlobRow>(
-        "SELECT b.id, b.stored_sha256
-         FROM blobs b LEFT JOIN artifacts a ON a.blob_id = b.id
-         WHERE a.id IS NULL",
+    // A restart may find rows left by a crash between blob promotion and a
+    // snapshot commit. They become candidates, not immediate deletions: the
+    // same server-time grace and relationship-authoritative GC path applies
+    // to crash recovery and explicit snapshot deletion alike.
+    let now = OffsetDateTime::now_utc();
+    let orphaned_at = format_time(now).map_err(|_| MaintenanceError::Clock)?;
+    let eligible_at = database::expiration_time(now, state.blob_gc_grace);
+    let eligible_after = format_time(eligible_at).map_err(|_| MaintenanceError::Clock)?;
+    let eligible_after_seq = database::sort_key_from_timestamp(eligible_at);
+    let mut transaction = state
+        .database
+        .begin()
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    sqlx::query(
+        "UPDATE blobs
+         SET orphaned_at = NULL, eligible_after = NULL, eligible_after_seq = NULL
+         WHERE EXISTS (
+             SELECT 1
+             FROM artifacts artifact
+             JOIN snapshots snapshot ON snapshot.id = artifact.snapshot_id
+             WHERE artifact.blob_id = blobs.id AND snapshot.deleted_at IS NULL
+         )",
     )
-    .fetch_all(&state.database)
+    .execute(&mut *transaction)
     .await
     .map_err(|_| MaintenanceError::Operation)?;
-    if !unreferenced.is_empty() {
-        let mut transaction = state
-            .database
-            .begin()
-            .await
-            .map_err(|_| MaintenanceError::Operation)?;
-        for blob in &unreferenced {
-            sqlx::query("DELETE FROM blobs WHERE id = ?1")
-                .bind(&blob.id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|_| MaintenanceError::Operation)?;
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|_| MaintenanceError::Operation)?;
-        for blob in unreferenced {
-            StorageLayout::remove_file(&state.storage.blob_path(&blob.stored_sha256))
-                .await
-                .map_err(|_| MaintenanceError::Operation)?;
-        }
-    }
+    sqlx::query(
+        "UPDATE blobs
+         SET orphaned_at = ?1, eligible_after = ?2, eligible_after_seq = ?3
+         WHERE eligible_after_seq IS NULL
+           AND NOT EXISTS (
+               SELECT 1
+               FROM artifacts artifact
+               JOIN snapshots snapshot ON snapshot.id = artifact.snapshot_id
+               WHERE artifact.blob_id = blobs.id AND snapshot.deleted_at IS NULL
+           )",
+    )
+    .bind(&orphaned_at)
+    .bind(&eligible_after)
+    .bind(eligible_after_seq)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
 
     let known: HashSet<String> = sqlx::query_as::<_, (String,)>("SELECT stored_sha256 FROM blobs")
         .fetch_all(&state.database)
@@ -3581,12 +3687,6 @@ async fn remove_recovery_entry(path: &Path) -> Result<(), MaintenanceError> {
 }
 
 #[derive(FromRow)]
-struct OrphanedBlobRow {
-    id: String,
-    stored_sha256: String,
-}
-
-#[derive(FromRow)]
 struct ReconcileSnapshotRow {
     canonical_json: String,
     manifest_sha256: String,
@@ -3618,7 +3718,7 @@ pub(crate) async fn reconcile_snapshot(
         "SELECT m.canonical_json, m.sha256 AS manifest_sha256, s.artifact_count,
                 s.total_original_size_bytes, s.total_stored_size_bytes
          FROM snapshots s JOIN manifests m ON m.id = s.manifest_id
-         WHERE s.id = ?1",
+         WHERE s.id = ?1 AND s.deleted_at IS NULL",
     )
     .bind(snapshot_id)
     .fetch_optional(database)

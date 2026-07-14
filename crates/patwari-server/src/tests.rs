@@ -18,10 +18,11 @@ use crate::{
     ReconciliationError, Service,
     config::Config,
     contract::{
-        Artifact, ArtifactMetadataResponse, CanonicalManifestResponse, CanonicalManifestSummary,
-        CaptureProvenance, CompletionResponse, Compression, Manifest, ManifestInput,
-        PaginatedResponse, Receipt, SessionInput, SessionResponse, SnapshotCapturesResponse,
-        SnapshotResponse, SnapshotSummary, UploadResponse, UploadStatus, UploadStatusResponse,
+        Artifact, ArtifactMetadataResponse, BlobGcResponse, CanonicalManifestResponse,
+        CanonicalManifestSummary, CaptureProvenance, CompletionResponse, Compression, Manifest,
+        ManifestInput, PaginatedResponse, Receipt, SessionInput, SessionResponse,
+        SnapshotCapturesResponse, SnapshotResponse, SnapshotSummary, TombstoneResponse,
+        UploadResponse, UploadStatus, UploadStatusResponse,
     },
 };
 
@@ -112,6 +113,36 @@ fn json_request<T: serde::Serialize + ?Sized>(method: &str, uri: &str, body: &T)
             serde_json::to_string(body).expect("test JSON serializes"),
         ))
         .expect("request is valid")
+}
+
+fn deletion_confirmation(snapshot_id: &str, fingerprint: &str) -> String {
+    let fingerprint = fingerprint
+        .strip_prefix("sha256:")
+        .expect("snapshot fingerprint is a canonical SHA-256 document value");
+    format!("delete-snapshot:{snapshot_id}:sha256:{fingerprint}")
+}
+
+async fn delete_snapshot(
+    service: &Service,
+    config: &Config,
+    snapshot_id: &str,
+    fingerprint: &str,
+    reason: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let body = serde_json::json!({
+        "confirmation": deletion_confirmation(snapshot_id, fingerprint),
+        "reason": reason,
+    });
+    let (status, _, body) = call(
+        service.router(config),
+        json_request(
+            "DELETE",
+            &format!("/api/v1/admin/snapshots/{snapshot_id}"),
+            &body,
+        ),
+    )
+    .await;
+    (status, body)
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -4336,4 +4367,862 @@ async fn assert_artifact_integrity_failure(service: &Service, config: &Config, c
             .expect("integrity error is utf-8")
             .contains("artifact_integrity_failure")
     );
+}
+
+#[tokio::test]
+async fn snapshot_deletion_is_disabled_by_default_and_requires_exact_confirmation() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"guarded deletion";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "default-deletion-guard",
+        manifest(bytes, bytes, Compression::Identity),
+        bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+
+    let (disabled, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .method("DELETE")
+            .uri(format!(
+                "/api/v1/admin/snapshots/{}",
+                completion.receipt.snapshot_id
+            ))
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(disabled, StatusCode::FORBIDDEN);
+
+    let enabled_data_dir = TestDataDir::new();
+    let mut enabled_config = test_config(&enabled_data_dir);
+    enabled_config.admin_deletion_enabled = true;
+    let (enabled, _) = Service::bootstrap(&enabled_config)
+        .await
+        .expect("enabled archive bootstraps");
+    let enabled_client = Uuid::new_v4();
+    register(enabled.router(&enabled_config), enabled_client).await;
+    let enabled_upload = upload_full(
+        &enabled,
+        &enabled_config,
+        enabled_client,
+        "enabled-deletion-guard",
+        manifest(bytes, bytes, Compression::Identity),
+        bytes,
+    )
+    .await;
+    let enabled_completion =
+        complete_upload_for_completion(&enabled, &enabled_config, &enabled_upload.completion_url)
+            .await;
+    let delete_url = format!(
+        "/api/v1/admin/snapshots/{}",
+        enabled_completion.receipt.snapshot_id
+    );
+
+    let (missing, _, _) = call(
+        enabled.router(&enabled_config),
+        Request::builder()
+            .method("DELETE")
+            .uri(&delete_url)
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(missing, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (wrong, _, wrong_body) = call(
+        enabled.router(&enabled_config),
+        json_request(
+            "DELETE",
+            &delete_url,
+            &serde_json::json!({"confirmation": "delete-snapshot:not-this-one:sha256:bad"}),
+        ),
+    )
+    .await;
+    assert_eq!(wrong, StatusCode::CONFLICT);
+    assert!(
+        String::from_utf8(wrong_body)
+            .expect("error is text")
+            .contains("deletion_confirmation_mismatch")
+    );
+
+    let header_confirmation = deletion_confirmation(
+        &enabled_completion.receipt.snapshot_id,
+        &enabled_completion.receipt.snapshot_fingerprint,
+    );
+    let (deleted, _, _) = call(
+        enabled.router(&enabled_config),
+        Request::builder()
+            .method("DELETE")
+            .uri(delete_url)
+            .header("x-patwari-delete-confirmation", header_confirmation)
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(deleted, StatusCode::OK);
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn tombstoning_hides_normal_resources_and_falls_back_latest_projection() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.admin_deletion_enabled = true;
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let older_bytes = b"older snapshot";
+    let older_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "tombstone-older",
+        manifest(older_bytes, older_bytes, Compression::Identity),
+        older_bytes,
+    )
+    .await;
+    let older =
+        complete_upload_for_completion(&service, &config, &older_upload.completion_url).await;
+
+    let latest_bytes = b"latest snapshot";
+    let latest_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "tombstone-latest",
+        manifest(latest_bytes, latest_bytes, Compression::Identity),
+        latest_bytes,
+    )
+    .await;
+    let latest =
+        complete_upload_for_completion(&service, &config, &latest_upload.completion_url).await;
+    let latest_snapshot = fetch_snapshot(&service, &config, &latest.receipt.snapshot_id).await;
+    let latest_artifact = latest_snapshot.artifacts[0].clone();
+
+    let (deleted, deleted_body) = delete_snapshot(
+        &service,
+        &config,
+        &latest.receipt.snapshot_id,
+        &latest.receipt.snapshot_fingerprint,
+        Some("operator requested retention cleanup"),
+    )
+    .await;
+    assert_eq!(deleted, StatusCode::OK);
+    let tombstone: TombstoneResponse =
+        serde_json::from_slice(&deleted_body).expect("tombstone parses");
+    assert_eq!(tombstone.snapshot_id, latest.receipt.snapshot_id);
+    assert_eq!(
+        tombstone.snapshot_fingerprint,
+        latest.receipt.snapshot_fingerprint
+    );
+    assert_eq!(
+        tombstone.historical_receipt.snapshot_id,
+        latest.receipt.snapshot_id
+    );
+    assert_eq!(tombstone.capture_count, 1);
+    assert_eq!(
+        tombstone.reason.as_deref(),
+        Some("operator requested retention cleanup")
+    );
+    let durable_delete: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM artifacts WHERE snapshot_id = ?1),
+            (SELECT COUNT(*) FROM tombstones WHERE snapshot_id = ?1),
+            (SELECT COUNT(*) FROM deletion_audits WHERE snapshot_id = ?1)",
+    )
+    .bind(&latest.receipt.snapshot_id)
+    .fetch_one(&service.state.database)
+    .await
+    .expect("tombstone transaction committed");
+    assert_eq!(durable_delete, (0, 1, 1));
+
+    // A fully confirmed repeat returns the same durable history without a
+    // second audit event or an attempt to remove already-removed references.
+    let (repeated, repeated_body) = delete_snapshot(
+        &service,
+        &config,
+        &latest.receipt.snapshot_id,
+        &latest.receipt.snapshot_fingerprint,
+        Some("operator requested retention cleanup"),
+    )
+    .await;
+    assert_eq!(repeated, StatusCode::OK);
+    let repeated_tombstone: TombstoneResponse =
+        serde_json::from_slice(&repeated_body).expect("repeated tombstone parses");
+    assert_eq!(repeated_tombstone.tombstone_id, tombstone.tombstone_id);
+    assert_eq!(
+        repeated_tombstone.deletion_audit_id,
+        tombstone.deletion_audit_id
+    );
+
+    for uri in [
+        format!("/api/v1/snapshots/{}", latest.receipt.snapshot_id),
+        latest.capture.capture_url.clone(),
+        latest_snapshot.manifest_url.clone(),
+        latest_artifact.metadata_url.clone(),
+        latest_artifact.content_url.clone(),
+    ] {
+        let (status, _, _) = call(
+            service.router(&config),
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("normal read request is valid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    let (historical_completion_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .method("POST")
+            .uri(&latest_upload.completion_url)
+            .body(Body::empty())
+            .expect("historical completion request is valid"),
+    )
+    .await;
+    assert_eq!(
+        historical_completion_status,
+        StatusCode::NOT_FOUND,
+        "the old receipt is available only through the admin tombstone"
+    );
+
+    let session: SessionResponse = get_json(
+        &service,
+        &config,
+        format!("/api/v1/sessions/{}", older.receipt.session_id),
+    )
+    .await;
+    assert_eq!(
+        session.latest_snapshot.snapshot_id,
+        older.receipt.snapshot_id
+    );
+    let snapshots: PaginatedResponse<SnapshotSummary> = get_json(
+        &service,
+        &config,
+        format!("/api/v1/sessions/{}/snapshots", older.receipt.session_id),
+    )
+    .await;
+    assert_eq!(
+        snapshots
+            .items
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![older.receipt.snapshot_id.as_str()]
+    );
+
+    let admin_history: TombstoneResponse = get_json(
+        &service,
+        &config,
+        format!("/api/v1/admin/tombstones/{}", latest.receipt.snapshot_id),
+    )
+    .await;
+    assert_eq!(admin_history.tombstone_id, tombstone.tombstone_id);
+    let history: PaginatedResponse<TombstoneResponse> =
+        get_json(&service, &config, "/api/v1/admin/tombstones").await;
+    assert_eq!(history.items.len(), 1);
+    assert_eq!(history.items[0].snapshot_id, latest.receipt.snapshot_id);
+
+    let (older_deleted, _) = delete_snapshot(
+        &service,
+        &config,
+        &older.receipt.snapshot_id,
+        &older.receipt.snapshot_fingerprint,
+        None,
+    )
+    .await;
+    assert_eq!(older_deleted, StatusCode::OK);
+    let (session_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .uri(format!("/api/v1/sessions/{}", older.receipt.session_id))
+            .body(Body::empty())
+            .expect("session request is valid"),
+    )
+    .await;
+    assert_eq!(session_status, StatusCode::NOT_FOUND);
+}
+
+/// Tombstone listing must use the same opaque numeric sort-key + UUID
+/// high-watermark/after cursor semantics as the normal retrieval
+/// collections (see
+/// `archive_browsing_keyset_pages_are_stable_across_newer_records_and_ties`):
+/// the first page establishes the high watermark, later cursors carry and
+/// enforce it, and a tombstone created mid-traversal must not interleave
+/// into an in-progress page walk.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn admin_tombstone_pagination_is_stable_across_newer_tombstones_and_ties() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.admin_deletion_enabled = true;
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let mut tombstone_ids = Vec::new();
+    for name in [
+        "tombstone-tie-one",
+        "tombstone-tie-two",
+        "tombstone-tie-three",
+    ] {
+        let bytes = format!("tombstone pagination {name}").into_bytes();
+        let upload = upload_full(
+            &service,
+            &config,
+            client_id,
+            name,
+            manifest(&bytes, &bytes, Compression::Identity),
+            &bytes,
+        )
+        .await;
+        let completion =
+            complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+        let (deleted, deleted_body) = delete_snapshot(
+            &service,
+            &config,
+            &completion.receipt.snapshot_id,
+            &completion.receipt.snapshot_fingerprint,
+            None,
+        )
+        .await;
+        assert_eq!(deleted, StatusCode::OK);
+        let tombstone: TombstoneResponse =
+            serde_json::from_slice(&deleted_body).expect("tombstone parses");
+        tombstone_ids.push(tombstone.tombstone_id);
+    }
+
+    // Force a deterministic tie so the traversal also exercises the id
+    // tie-breaker, matching the equivalent snapshot-pagination coverage.
+    let tied_time = "2000-01-01T00:00:00Z";
+    let tied_sort_key =
+        crate::database::sort_key_from_rfc3339(tied_time).expect("tied_time parses");
+    for tombstone_id in &tombstone_ids {
+        sqlx::query("UPDATE tombstones SET deleted_at = ?1, deleted_at_seq = ?2 WHERE id = ?3")
+            .bind(tied_time)
+            .bind(tied_sort_key)
+            .bind(tombstone_id)
+            .execute(&service.state.database)
+            .await
+            .expect("test can establish a deterministic timestamp tie");
+    }
+    let mut expected = tombstone_ids.clone();
+    expected.sort_unstable_by(|left, right| right.cmp(left));
+
+    let first_page: PaginatedResponse<TombstoneResponse> =
+        get_json(&service, &config, "/api/v1/admin/tombstones?limit=1").await;
+    assert_eq!(first_page.items.len(), 1);
+    assert_eq!(first_page.items[0].tombstone_id, expected[0]);
+    let high_watermark = first_page
+        .high_watermark
+        .clone()
+        .expect("first page establishes a high watermark");
+    let first_cursor = first_page
+        .next_cursor
+        .clone()
+        .expect("more tied tombstones require a cursor");
+    assert!(
+        !first_cursor.contains(&expected[0]),
+        "the cursor is opaque rather than a raw resource identifier"
+    );
+
+    // Insert a newer tombstone between pages. It must never interleave into
+    // the in-progress traversal, and the high watermark must stay identical
+    // across every remaining page.
+    let newer_bytes = b"tombstone pagination newer";
+    let newer_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "tombstone-newer",
+        manifest(newer_bytes, newer_bytes, Compression::Identity),
+        newer_bytes,
+    )
+    .await;
+    let newer_completion =
+        complete_upload_for_completion(&service, &config, &newer_upload.completion_url).await;
+    let (newer_deleted, newer_deleted_body) = delete_snapshot(
+        &service,
+        &config,
+        &newer_completion.receipt.snapshot_id,
+        &newer_completion.receipt.snapshot_fingerprint,
+        None,
+    )
+    .await;
+    assert_eq!(newer_deleted, StatusCode::OK);
+    let newer_tombstone: TombstoneResponse =
+        serde_json::from_slice(&newer_deleted_body).expect("newer tombstone parses");
+
+    let mut seen = vec![first_page.items[0].tombstone_id.clone()];
+    let mut cursor = Some(first_cursor);
+    while let Some(next_cursor) = cursor {
+        let page: PaginatedResponse<TombstoneResponse> = get_json(
+            &service,
+            &config,
+            format!("/api/v1/admin/tombstones?limit=1&cursor={next_cursor}"),
+        )
+        .await;
+        assert_eq!(
+            page.high_watermark.as_ref(),
+            Some(&high_watermark),
+            "the high watermark must stay identical across every page of one traversal"
+        );
+        seen.extend(page.items.iter().map(|item| item.tombstone_id.clone()));
+        cursor = page.next_cursor;
+    }
+    assert_eq!(seen, expected);
+    assert!(
+        !seen.contains(&newer_tombstone.tombstone_id),
+        "a tombstone created mid-traversal must not interleave into the page walk"
+    );
+    assert_eq!(
+        seen.iter().collect::<std::collections::HashSet<_>>().len(),
+        seen.len(),
+        "keyset traversal neither duplicates nor skips tied tombstones"
+    );
+
+    let (invalid_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .uri("/api/v1/admin/tombstones?cursor=not-a-cursor")
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(invalid_status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let mut tampered: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(
+                first_page
+                    .next_cursor
+                    .as_deref()
+                    .expect("cursor bytes decode"),
+            )
+            .expect("cursor bytes decode"),
+    )
+    .expect("cursor is JSON");
+    tampered["kind"] = serde_json::Value::String("snapshots".to_owned());
+    let tampered_cursor =
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&tampered).expect("tampered cursor serializes"));
+    let (tampered_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .uri(format!(
+                "/api/v1/admin/tombstones?limit=1&cursor={tampered_cursor}"
+            ))
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(tampered_status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    for limit in [0, 101] {
+        let (status, _, _) = call(
+            service.router(&config),
+            Request::builder()
+                .uri(format!("/api/v1/admin/tombstones?limit={limit}"))
+                .body(Body::empty())
+                .expect("request is valid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn blob_gc_honors_live_relationships_grace_and_last_reference() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.admin_deletion_enabled = true;
+    config.blob_gc_grace = Duration::from_mins(1);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"shared garbage collection blob";
+
+    let first_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "shared-gc-first",
+        manifest_with_session(bytes, bytes, Compression::Identity, "shared-gc-first"),
+        bytes,
+    )
+    .await;
+    let first =
+        complete_upload_for_completion(&service, &config, &first_upload.completion_url).await;
+    let second_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "shared-gc-second",
+        manifest_with_session(bytes, bytes, Compression::Identity, "shared-gc-second"),
+        bytes,
+    )
+    .await;
+    let second =
+        complete_upload_for_completion(&service, &config, &second_upload.completion_url).await;
+    let blob_digest = digest_storage_hex(bytes);
+    let blob_path = service.state.storage.blob_path(&blob_digest);
+    assert!(blob_path.exists());
+
+    let (first_deleted, _) = delete_snapshot(
+        &service,
+        &config,
+        &first.receipt.snapshot_id,
+        &first.receipt.snapshot_fingerprint,
+        None,
+    )
+    .await;
+    assert_eq!(first_deleted, StatusCode::OK);
+    let candidate_after_shared_delete: (Option<String>,) =
+        sqlx::query_as("SELECT eligible_after FROM blobs WHERE stored_sha256 = ?1")
+            .bind(&blob_digest)
+            .fetch_one(&service.state.database)
+            .await
+            .expect("shared blob remains");
+    assert!(
+        candidate_after_shared_delete.0.is_none(),
+        "a shared live Artifact relationship prevents candidate scheduling"
+    );
+
+    // Simulate a stale candidate/cache state. GC must recheck relationship
+    // rows and leave the live blob intact rather than trusting this metadata.
+    sqlx::query(
+        "UPDATE blobs SET orphaned_at = '2000-01-01T00:00:00Z',
+                          eligible_after = '2000-01-01T00:00:00Z',
+                          eligible_after_seq = 0
+         WHERE stored_sha256 = ?1",
+    )
+    .bind(&blob_digest)
+    .execute(&service.state.database)
+    .await
+    .expect("test can establish stale candidate state");
+    let stale_gc: BlobGcResponse = service
+        .collect_blob_garbage()
+        .await
+        .expect("GC checks live relationships");
+    assert_eq!(stale_gc.deleted_blobs, 0);
+    assert!(blob_path.exists());
+    let cleared_after_live_recheck: (Option<String>,) =
+        sqlx::query_as("SELECT eligible_after FROM blobs WHERE stored_sha256 = ?1")
+            .bind(&blob_digest)
+            .fetch_one(&service.state.database)
+            .await
+            .expect("live blob remains");
+    assert!(cleared_after_live_recheck.0.is_none());
+
+    let (second_deleted, _) = delete_snapshot(
+        &service,
+        &config,
+        &second.receipt.snapshot_id,
+        &second.receipt.snapshot_fingerprint,
+        None,
+    )
+    .await;
+    assert_eq!(second_deleted, StatusCode::OK);
+    let scheduled: (Option<String>,) =
+        sqlx::query_as("SELECT eligible_after FROM blobs WHERE stored_sha256 = ?1")
+            .bind(&blob_digest)
+            .fetch_one(&service.state.database)
+            .await
+            .expect("orphan candidate remains during grace");
+    assert!(scheduled.0.is_some());
+    let during_grace = service
+        .collect_blob_garbage()
+        .await
+        .expect("GC can run during grace");
+    assert_eq!(during_grace.deleted_blobs, 0);
+    assert!(blob_path.exists());
+
+    sqlx::query(
+        "UPDATE blobs
+         SET eligible_after = '2000-01-01T00:00:00Z', eligible_after_seq = 0
+         WHERE stored_sha256 = ?1",
+    )
+    .bind(&blob_digest)
+    .execute(&service.state.database)
+    .await
+    .expect("test can advance only the persisted server-time eligibility");
+    let collected = service
+        .collect_blob_garbage()
+        .await
+        .expect("eligible orphan is collected");
+    assert_eq!(collected.deleted_blobs, 1);
+    assert!(!blob_path.exists());
+    let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs WHERE stored_sha256 = ?1")
+        .bind(&blob_digest)
+        .fetch_one(&service.state.database)
+        .await
+        .expect("blob query succeeds");
+    assert_eq!(remaining.0, 0);
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn identical_rearchive_gets_a_new_snapshot_and_persists_tombstone_linkage() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.admin_deletion_enabled = true;
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"same state after tombstone";
+    let document = manifest(bytes, bytes, Compression::Identity);
+    let first_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "rearchive-first",
+        document.clone(),
+        bytes,
+    )
+    .await;
+    let first =
+        complete_upload_for_completion(&service, &config, &first_upload.completion_url).await;
+    let (deleted, deleted_body) = delete_snapshot(
+        &service,
+        &config,
+        &first.receipt.snapshot_id,
+        &first.receipt.snapshot_fingerprint,
+        Some("replace with a newly verified capture"),
+    )
+    .await;
+    assert_eq!(deleted, StatusCode::OK);
+    let tombstone: TombstoneResponse =
+        serde_json::from_slice(&deleted_body).expect("tombstone parses");
+
+    let rearchive_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "rearchive-second-a",
+        document.clone(),
+        bytes,
+    )
+    .await;
+    let concurrent_rearchive_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "rearchive-second-b",
+        document,
+        bytes,
+    )
+    .await;
+    let first_app = service.router(&config);
+    let first_url = rearchive_upload.completion_url.clone();
+    let first_completion = tokio::spawn(async move {
+        call(
+            first_app,
+            Request::builder()
+                .method("POST")
+                .uri(first_url)
+                .body(Body::empty())
+                .expect("completion request is valid"),
+        )
+        .await
+    });
+    let second_app = service.router(&config);
+    let second_url = concurrent_rearchive_upload.completion_url.clone();
+    let second_completion = tokio::spawn(async move {
+        call(
+            second_app,
+            Request::builder()
+                .method("POST")
+                .uri(second_url)
+                .body(Body::empty())
+                .expect("completion request is valid"),
+        )
+        .await
+    });
+    let (first_status, _, first_body) = first_completion
+        .await
+        .expect("first rearchive completion joins");
+    let (second_status, _, second_body) = second_completion
+        .await
+        .expect("second rearchive completion joins");
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    let rearchive: CompletionResponse =
+        serde_json::from_slice(&first_body).expect("first rearchive parses");
+    let concurrent_rearchive: CompletionResponse =
+        serde_json::from_slice(&second_body).expect("second rearchive parses");
+    assert_eq!(
+        concurrent_rearchive.receipt.snapshot_id,
+        rearchive.receipt.snapshot_id
+    );
+    assert_ne!(rearchive.receipt.snapshot_id, first.receipt.snapshot_id);
+    assert_eq!(
+        rearchive.receipt.snapshot_fingerprint,
+        first.receipt.snapshot_fingerprint
+    );
+    let linked: TombstoneResponse = get_json(
+        &service,
+        &config,
+        format!("/api/v1/admin/tombstones/{}", first.receipt.snapshot_id),
+    )
+    .await;
+    assert_eq!(
+        linked.rearchived_snapshot_id.as_deref(),
+        Some(rearchive.receipt.snapshot_id.as_str())
+    );
+    let linkage: (Option<String>,) =
+        sqlx::query_as("SELECT rearchived_from_tombstone_id FROM snapshots WHERE id = ?1")
+            .bind(&rearchive.receipt.snapshot_id)
+            .fetch_one(&service.state.database)
+            .await
+            .expect("rearchive link is stored");
+    assert_eq!(linkage.0.as_deref(), Some(tombstone.tombstone_id.as_str()));
+
+    drop(service);
+    let (restarted, _) = Service::bootstrap(&config).await.expect("restarts");
+    let persisted: TombstoneResponse = get_json(
+        &restarted,
+        &config,
+        format!("/api/v1/admin/tombstones/{}", first.receipt.snapshot_id),
+    )
+    .await;
+    assert_eq!(
+        persisted.rearchived_snapshot_id.as_deref(),
+        Some(rearchive.receipt.snapshot_id.as_str())
+    );
+    let live = fetch_snapshot(&restarted, &config, &rearchive.receipt.snapshot_id).await;
+    assert_eq!(live.snapshot_id, rearchive.receipt.snapshot_id);
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_deletion_and_gc_race_preserves_live_rearchive_blob() {
+    use crate::service::Checkpoint;
+
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.admin_deletion_enabled = true;
+    config.blob_gc_grace = Duration::from_mins(1);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"completion deletion gc race";
+    let document = manifest(bytes, bytes, Compression::Identity);
+
+    let original_upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "race-original",
+        document.clone(),
+        bytes,
+    )
+    .await;
+    let original =
+        complete_upload_for_completion(&service, &config, &original_upload.completion_url).await;
+    let staged_rearchive = upload_full(
+        &service,
+        &config,
+        client_id,
+        "race-rearchive",
+        document,
+        bytes,
+    )
+    .await;
+    let blob_digest = digest_storage_hex(bytes);
+    let blob_path = service.state.storage.blob_path(&blob_digest);
+
+    let deletion_checkpoint = Checkpoint::new();
+    service
+        .state
+        .test_hooks
+        .set_before_snapshot_deletion_commit(deletion_checkpoint.clone());
+    let delete_app = service.router(&config);
+    let delete_url = format!("/api/v1/admin/snapshots/{}", original.receipt.snapshot_id);
+    let confirmation = deletion_confirmation(
+        &original.receipt.snapshot_id,
+        &original.receipt.snapshot_fingerprint,
+    );
+    let delete_task = tokio::spawn(async move {
+        call(
+            delete_app,
+            json_request(
+                "DELETE",
+                &delete_url,
+                &serde_json::json!({"confirmation": confirmation}),
+            ),
+        )
+        .await
+    });
+    deletion_checkpoint.wait_for_arrival().await;
+
+    let blob_lock_checkpoint = Checkpoint::new();
+    service
+        .state
+        .test_hooks
+        .set_before_blob_lock_acquire(blob_lock_checkpoint.clone());
+    let complete_app = service.router(&config);
+    let completion_url = staged_rearchive.completion_url.clone();
+    let completion_task = tokio::spawn(async move {
+        call(
+            complete_app,
+            Request::builder()
+                .method("POST")
+                .uri(completion_url)
+                .body(Body::empty())
+                .expect("completion request is valid"),
+        )
+        .await
+    });
+
+    deletion_checkpoint.resume();
+    let (delete_status, _, _) = delete_task.await.expect("delete task joins");
+    assert_eq!(delete_status, StatusCode::OK);
+    blob_lock_checkpoint.wait_for_arrival().await;
+
+    // The snapshot deletion committed an orphan candidate. Make it due while
+    // completion is paused before its digest lock; GC may delete the old
+    // file/row, but completion must promote its staged verified bytes and add
+    // a live relationship afterward.
+    sqlx::query(
+        "UPDATE blobs
+         SET eligible_after = '2000-01-01T00:00:00Z', eligible_after_seq = 0
+         WHERE stored_sha256 = ?1",
+    )
+    .bind(&blob_digest)
+    .execute(&service.state.database)
+    .await
+    .expect("test can make the orphan candidate due");
+    let gc = service
+        .collect_blob_garbage()
+        .await
+        .expect("GC completes while rearchive waits");
+    assert_eq!(gc.deleted_blobs, 1);
+    assert!(!blob_path.exists());
+
+    blob_lock_checkpoint.resume();
+    let (completion_status, _, completion_body) =
+        completion_task.await.expect("completion task joins");
+    assert_eq!(completion_status, StatusCode::OK);
+    let rearchive: CompletionResponse =
+        serde_json::from_slice(&completion_body).expect("rearchive completion parses");
+    assert_ne!(rearchive.receipt.snapshot_id, original.receipt.snapshot_id);
+    assert!(blob_path.exists());
+
+    let live = fetch_snapshot(&service, &config, &rearchive.receipt.snapshot_id).await;
+    let (content_status, content) =
+        fetch_content(&service, &config, &live.artifacts[0].content_url).await;
+    assert_eq!(content_status, StatusCode::OK);
+    assert_eq!(content, bytes);
 }

@@ -477,6 +477,53 @@ pub struct ArtifactMetadataResponse {
     pub content_url: String,
 }
 
+/// Optional JSON document for an administrative snapshot deletion request.
+///
+/// The confirmation may instead be supplied in the
+/// `X-Patwari-Delete-Confirmation` header. At least one location is
+/// required, and any supplied values must agree exactly.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteSnapshotRequest {
+    #[serde(default)]
+    pub confirmation: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Minimal durable history for a deliberately deleted snapshot. This response
+/// intentionally does not include artifact paths, artifact metadata, or
+/// manifest content. The linked capture count describes retained provenance
+/// without making deleted capture documents normally retrievable.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TombstoneResponse {
+    pub tombstone_id: String,
+    pub deletion_audit_id: String,
+    pub owner_namespace: String,
+    pub session_id: String,
+    pub snapshot_id: String,
+    pub snapshot_fingerprint: String,
+    pub manifest_sha256: String,
+    pub snapshot_completed_at: String,
+    pub deleted_at: String,
+    pub deleted_at_sort_key: i64,
+    pub reason: Option<String>,
+    pub capture_count: u64,
+    /// Set when an identical later capture created a distinct live snapshot.
+    pub rearchived_snapshot_id: Option<String>,
+    pub rearchived_snapshot_url: Option<String>,
+    /// Receipts for tombstoned snapshots are available only through this
+    /// administrative representation.
+    pub historical_receipt: Receipt,
+}
+
+/// Bounded result from one explicit administrative blob-GC pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobGcResponse {
+    pub inspected_blobs: u32,
+    pub deleted_blobs: u32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: ErrorDetail,

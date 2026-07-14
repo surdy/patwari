@@ -35,6 +35,10 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, code, message)
     }
 
+    pub(crate) const fn forbidden(code: &'static str, message: &'static str) -> Self {
+        Self::new(StatusCode::FORBIDDEN, code, message)
+    }
+
     pub(crate) const fn not_found(code: &'static str, message: &'static str) -> Self {
         Self::new(StatusCode::NOT_FOUND, code, message)
     }

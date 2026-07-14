@@ -8,9 +8,11 @@ pub mod config;
 pub mod contract;
 
 mod database;
+mod deletion;
 mod error;
 mod health;
 mod ingestion;
+mod pagination;
 mod retrieval;
 mod service;
 mod storage;

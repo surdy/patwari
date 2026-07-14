@@ -7,3 +7,8 @@ Tracking original and stored hashes separately allows compression settings and r
 change without inventing new session states, while still supporting exact transfer verification and
 blob deduplication. Client/capture IDs, source and server times, source cursor/state hash, Munshi
 version, opaque source metadata, and transfer metrics are provenance rather than snapshot identity.
+
+Deletion does not make a semantic fingerprint reusable as the same historical resource: it records a
+Tombstone for the deleted snapshot ID. A later capture of the same fingerprint creates a new snapshot
+ID linked to that Tombstone, while Blob liveness remains derived from live Artifact relationships
+rather than semantic identity or a cached count.

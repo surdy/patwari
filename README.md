@@ -56,6 +56,8 @@ Configuration is environment-based and bounded by default:
 | `PATWARI_MAX_SNAPSHOT_STORED_BYTES` | `4294967296` | Maximum stored-byte sum in one snapshot |
 | `PATWARI_MAX_SNAPSHOT_ORIGINAL_BYTES` | `17179869184` | Maximum original-byte sum in one snapshot |
 | `PATWARI_UPLOAD_EXPIRY` | `24h` | Server-time lifetime of an unfinished upload |
+| `PATWARI_ADMIN_DELETION_ENABLED` | `false` | Enables trusted-boundary administrative deletion and GC HTTP endpoints |
+| `PATWARI_BLOB_GC_GRACE` | `7d` | Server-time delay before an unreferenced blob is GC eligible |
 
 The body limit is 1 KiB–64 MiB, request concurrency is 1–256, download concurrency is 1–64,
 timeout is 1s–5m, chunk size is
@@ -66,6 +68,11 @@ most 65,536 chunks per artifact; a snapshot is additionally capped at 262,144 ch
 accept `s`, `m`, `h`, or `d`. The
 service verifies both stored and decompressed sizes while streaming; it never trusts a declared
 checksum or size alone.
+
+Administrative deletion is opt-in: `PATWARI_ADMIN_DELETION_ENABLED` accepts only `true` or `false`
+and defaults to `false`. Blob-GC grace is 1m–365d; it defaults to 7d. Operators must enable the
+administrative surface only behind the same trusted network boundary required by the unauthenticated
+v1 service.
 
 Normal output is structured JSON and records only operational fields such as HTTP method, status,
 and duration. It does not log request bodies, archived content, credentials, or filesystem paths.
@@ -266,9 +273,15 @@ completed_at
 Only completed snapshots exist. Uploads are separate mutable transfer attempts, while snapshots,
 their canonical manifests, and their artifacts are immutable after verification.
 
-Normal archive reads exclude a future-tombstoned snapshot (`deleted_at` is currently only a schema
-hook; Patwari does not yet expose deletion). A deletion implementation must rebuild or update the
-latest-snapshot projection transactionally.
+An enabled administrative deletion creates a durable Tombstone and a separate deletion audit event,
+then marks the snapshot tombstoned and removes its `Artifact` relationships in one SQLite
+transaction. Normal reads exclude the tombstoned snapshot, its captures, manifests, and artifact
+resources. Captures and canonical manifests remain linked as internal history; the admin Tombstone
+representation deliberately exposes only receipt-scale identity/integrity facts and a capture count,
+never artifact paths or content. If the same fingerprint is archived later, a new snapshot ID is
+created and linked to the prior Tombstone; the deleted ID is never revived. Deleting the latest
+snapshot transactionally projects the next newest live snapshot, or clears the session from normal
+browsing when none remains.
 
 ### Artifact
 
@@ -419,6 +432,11 @@ GET    /api/v1/manifests/{manifest_id}
 GET    /api/v1/artifacts
 GET    /api/v1/artifacts/{artifact_id}
 GET    /api/v1/artifacts/{artifact_id}/content
+
+DELETE /api/v1/admin/snapshots/{snapshot_id}
+GET    /api/v1/admin/tombstones
+GET    /api/v1/admin/tombstones/{snapshot_id}
+POST   /api/v1/admin/blob-gc
 ```
 
 `POST /uploads` requires `capture_id` and reports it with the assigned `chunk_size_bytes`.
@@ -534,6 +552,33 @@ ID, canonical manifest digest, declared sizes and chunk count, timestamps, termi
 error code. They do not retain request bodies, paths, chunk checksums, manifest contents, or
 artifact content.
 
+### Administrative deletion and blob GC
+
+The `/api/v1/admin/*` surface returns `403` unless
+`PATWARI_ADMIN_DELETION_ENABLED=true`. It is an operator contract, not v1 authentication: expose it
+only inside the trusted boundary. `DELETE /api/v1/admin/snapshots/{snapshot_id}` requires an exact
+confirmation bound to the resource:
+
+```text
+delete-snapshot:<snapshot-id>:sha256:<snapshot-fingerprint-without-prefix>
+```
+
+Supply it in `X-Patwari-Delete-Confirmation` or in the optional JSON body's `confirmation` field;
+if both are supplied they must match. The optional JSON `reason` is bounded to 512 non-control
+bytes and must be non-sensitive. Repeating the same confirmed deletion returns the existing
+Tombstone/audit record without creating another event. `GET /admin/tombstones` is bounded and
+cursor-paginated; it is the only API representation that reissues a deleted snapshot's historical
+receipt. A rearchive is a new capture observation, so the client must submit a new `capture_id`;
+its new receipt names a new snapshot ID even when the fingerprint is identical.
+
+Deletion removes `Artifact` rows but does not immediately remove blobs. It records
+`orphaned_at`/`eligible_after` using server time only. `POST /admin/blob-gc` and the in-process
+maintenance call process a bounded batch after grace. Immediately before metadata and file removal,
+GC joins live `Artifact` → `Snapshot` relationships inside its transaction; an optional cached count
+can never authorize deletion. Digest-striped locks serialize completion, deletion, and GC. GC removes
+the metadata in an uncommitted transaction, removes the file while holding that digest lock, then
+commits, so a new reference cannot gain a missing file concurrently.
+
 ### Capture identity and idempotency
 
 - Client registration is an idempotent `PUT` keyed by its client-generated UUID. Hostname, display
@@ -581,8 +626,10 @@ artifact content.
   command that creates a SQLite online backup and a blob inventory for filesystem-level backup.
 - Patwari must not reuse a disposable application cache volume.
 
-Reference counts are transactional metadata. Blob garbage collection deletes only content with no
-snapshot references and only after a grace period.
+`Artifact` relationship rows are authoritative for blob liveness. Any operational count is
+rebuildable only and cannot authorize deletion. Blob GC deletes only content with no **live**
+SnapshotArtifact relationship after the persisted server-time grace period; rearchiving clears a
+pending candidate in the same transaction that creates the new relationship.
 
 ## Network and trust model
 
@@ -751,7 +798,7 @@ all compressed files byte-for-byte, and safely preview manual removal of the ori
 ## Deferred decisions
 
 - Exact Copilot CLI artifact set and consistency strategy, pending the Phase 0 spike.
-- Retention and explicit remote deletion policy.
+- Retention policy beyond explicit administrative snapshot deletion.
 - Authentication if Patwari crosses the trusted network boundary.
 - Restore compatibility contracts for each coding agent.
 - PostgreSQL or object-storage backends if single-node operation becomes insufficient.

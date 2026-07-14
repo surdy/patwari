@@ -70,8 +70,11 @@ per-upload transfer metrics belong in a completion envelope rather than the rece
 _Avoid_: Certificate, snapshot
 
 **Tombstone**:
-The durable record that an archived resource was explicitly deleted. Re-archiving the same state creates
-a new snapshot rather than silently reviving the deleted one.
+The durable, minimal record that an archived Snapshot was explicitly deleted, including its identity,
+canonical manifest hash, server deletion time, and linkage to any later rearchive. Artifact
+relationships are removed at deletion; an unreferenced Blob becomes only a grace-delayed candidate
+whose live relationship rows remain authoritative. Re-archiving the same state creates a new Snapshot
+linked to the Tombstone rather than silently reviving the deleted ID.
 _Avoid_: Soft delete, archived snapshot
 
 **Integrity finding**:

@@ -133,6 +133,17 @@ pub(crate) fn expiration_at(
     now: OffsetDateTime,
     duration: std::time::Duration,
 ) -> Result<String, time::error::Format> {
+    format_time(expiration_time(now, duration))
+}
+
+/// Derives a server-time deadline for bounded maintenance grace periods and
+/// upload expiry. Callers that compare it in `SQLite` should persist the
+/// accompanying `sort_key_from_timestamp` value rather than lexicographically
+/// comparing variable-precision RFC 3339 text.
+pub(crate) fn expiration_time(
+    now: OffsetDateTime,
+    duration: std::time::Duration,
+) -> OffsetDateTime {
     let seconds = i64::try_from(duration.as_secs()).expect("configuration duration fits i64");
-    format_time(now + time::Duration::seconds(seconds))
+    now + time::Duration::seconds(seconds)
 }

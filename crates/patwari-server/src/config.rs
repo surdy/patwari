@@ -15,6 +15,10 @@ pub const DEFAULT_MAX_ARTIFACT_COUNT: usize = 128;
 pub const DEFAULT_MAX_SNAPSHOT_STORED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_SNAPSHOT_ORIGINAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_EXPIRY: Duration = Duration::from_hours(24);
+pub const DEFAULT_ADMIN_DELETION_ENABLED: bool = false;
+/// A deleted snapshot remains recoverable from host backups while its
+/// unreferenced blobs wait for a conservative server-time grace period.
+pub const DEFAULT_BLOB_GC_GRACE: Duration = Duration::from_hours(7 * 24);
 pub const MAX_CHUNK_COUNT: u64 = 65_536;
 
 const MIN_REQUEST_BODY_BYTES: usize = 1024;
@@ -29,6 +33,8 @@ const MAX_ARTIFACT_COUNT: usize = 1_024;
 const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MIN_UPLOAD_EXPIRY: Duration = Duration::from_mins(1);
 const MAX_UPLOAD_EXPIRY: Duration = Duration::from_hours(720);
+const MIN_BLOB_GC_GRACE: Duration = Duration::from_mins(1);
+const MAX_BLOB_GC_GRACE: Duration = Duration::from_hours(365 * 24);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -45,6 +51,11 @@ pub struct Config {
     pub max_snapshot_stored_bytes: u64,
     pub max_snapshot_original_bytes: u64,
     pub upload_expiry: Duration,
+    /// Enables the trusted-boundary-only administrative deletion endpoints.
+    /// This is deliberately false unless an operator opts in explicitly.
+    pub admin_deletion_enabled: bool,
+    /// Server-time delay before an unreferenced blob becomes GC eligible.
+    pub blob_gc_grace: Duration,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -79,6 +90,10 @@ pub enum ConfigError {
     TooManyChunks,
     #[error("PATWARI_UPLOAD_EXPIRY must be a duration between 60s and 30d")]
     InvalidUploadExpiry,
+    #[error("PATWARI_ADMIN_DELETION_ENABLED must be exactly true or false")]
+    InvalidAdminDeletionEnabled,
+    #[error("PATWARI_BLOB_GC_GRACE must be a duration between 60s and 365d")]
+    InvalidBlobGcGrace,
 }
 
 impl Default for Config {
@@ -99,6 +114,8 @@ impl Default for Config {
             max_snapshot_stored_bytes: DEFAULT_MAX_SNAPSHOT_STORED_BYTES,
             max_snapshot_original_bytes: DEFAULT_MAX_SNAPSHOT_ORIGINAL_BYTES,
             upload_expiry: DEFAULT_UPLOAD_EXPIRY,
+            admin_deletion_enabled: DEFAULT_ADMIN_DELETION_ENABLED,
+            blob_gc_grace: DEFAULT_BLOB_GC_GRACE,
         }
     }
 }
@@ -214,6 +231,17 @@ impl Config {
                 .ok_or(ConfigError::InvalidUploadExpiry)?;
         }
 
+        if let Some(value) = values.get("PATWARI_ADMIN_DELETION_ENABLED") {
+            config.admin_deletion_enabled =
+                parse_bool(value).ok_or(ConfigError::InvalidAdminDeletionEnabled)?;
+        }
+
+        if let Some(value) = values.get("PATWARI_BLOB_GC_GRACE") {
+            config.blob_gc_grace = parse_duration(value)
+                .filter(|duration| *duration >= MIN_BLOB_GC_GRACE && *duration <= MAX_BLOB_GC_GRACE)
+                .ok_or(ConfigError::InvalidBlobGcGrace)?;
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -278,6 +306,9 @@ impl Config {
         if self.upload_expiry < MIN_UPLOAD_EXPIRY || self.upload_expiry > MAX_UPLOAD_EXPIRY {
             return Err(ConfigError::InvalidUploadExpiry);
         }
+        if self.blob_gc_grace < MIN_BLOB_GC_GRACE || self.blob_gc_grace > MAX_BLOB_GC_GRACE {
+            return Err(ConfigError::InvalidBlobGcGrace);
+        }
         Ok(())
     }
 }
@@ -323,6 +354,14 @@ fn parse_duration(value: &str) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +379,8 @@ mod tests {
         assert_eq!(config.max_artifact_count, 128);
         assert_eq!(config.max_snapshot_stored_bytes, 4 * 1024 * 1024 * 1024);
         assert_eq!(config.upload_expiry, Duration::from_hours(24));
+        assert!(!config.admin_deletion_enabled);
+        assert_eq!(config.blob_gc_grace, Duration::from_hours(7 * 24));
     }
 
     #[test]
@@ -358,6 +399,8 @@ mod tests {
             ("PATWARI_MAX_DOWNLOAD_CONCURRENCY".into(), "1".into()),
             ("PATWARI_REQUEST_TIMEOUT".into(), "5s".into()),
             ("PATWARI_UPLOAD_EXPIRY".into(), "2h".into()),
+            ("PATWARI_ADMIN_DELETION_ENABLED".into(), "true".into()),
+            ("PATWARI_BLOB_GC_GRACE".into(), "2d".into()),
         ]);
         let config = Config::from_values(&values).expect("configuration should parse");
 
@@ -373,6 +416,8 @@ mod tests {
         assert_eq!(config.max_download_concurrency, 1);
         assert_eq!(config.request_timeout, Duration::from_secs(5));
         assert_eq!(config.upload_expiry, Duration::from_hours(2));
+        assert!(config.admin_deletion_enabled);
+        assert_eq!(config.blob_gc_grace, Duration::from_hours(2 * 24));
     }
 
     #[test]
@@ -403,5 +448,20 @@ mod tests {
         ]);
         let error = Config::from_values(&values).expect_err("chunk bitmap must remain bounded");
         assert_eq!(error, ConfigError::TooManyChunks);
+
+        let values = HashMap::from([("PATWARI_ADMIN_DELETION_ENABLED".into(), "yes".into())]);
+        let error = Config::from_values(&values)
+            .expect_err("admin deletion must require an explicit boolean");
+        assert_eq!(error, ConfigError::InvalidAdminDeletionEnabled);
+
+        let values = HashMap::from([("PATWARI_BLOB_GC_GRACE".into(), "59s".into())]);
+        let error =
+            Config::from_values(&values).expect_err("blob deletion grace must remain bounded");
+        assert_eq!(error, ConfigError::InvalidBlobGcGrace);
+
+        let values = HashMap::from([("PATWARI_BLOB_GC_GRACE".into(), "366d".into())]);
+        let error =
+            Config::from_values(&values).expect_err("blob deletion grace must have a safe maximum");
+        assert_eq!(error, ConfigError::InvalidBlobGcGrace);
     }
 }
