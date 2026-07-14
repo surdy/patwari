@@ -21,8 +21,9 @@ opaque source session ID. Moving the conversation between clients does not creat
 _Avoid_: Upload, run, archive
 
 **Capture**:
-A client's observation of a session at a source-reported time and cursor. Repeated captures are retained
-as provenance even when they resolve to the same snapshot.
+A client's observation of a session, identified by a client-generated capture ID and source-reported
+time/cursor. Successful captures are retained as provenance even when they resolve to the same
+snapshot; expired or abandoned transfer attempts are not captures.
 _Avoid_: Snapshot, backup
 
 **Upload**:
@@ -37,7 +38,8 @@ _Avoid_: Upload, capture, revision
 
 **Capture context**:
 The stable source facts that distinguish a snapshot beyond its artifact contents, including repository,
-project, branch, source-agent version, and artifact-set version.
+project, branch, source-agent version, and artifact-set version. Capture provenance such as client,
+source/server times, source cursor/state hash, Munshi version, and opaque source metadata is excluded.
 _Avoid_: Session metadata, upload metadata
 
 **Manifest**:
@@ -47,7 +49,8 @@ _Avoid_: Index, receipt
 
 **Snapshot fingerprint**:
 Patwari's canonical identity for a snapshot within a session, derived from verified original artifact
-content and stable capture context while excluding provenance and storage representation.
+content and stable capture context while excluding capture/client provenance and storage
+representation. It is never a client capture ID.
 _Avoid_: Source state hash, manifest hash, blob hash
 
 **Artifact**:
@@ -62,7 +65,8 @@ _Avoid_: Artifact, snapshot
 
 **Receipt**:
 A reproducible, versioned document proving that Patwari accepted and verified a snapshot. It identifies
-the issuing archive instance but is not an independently mutable record.
+the issuing archive instance but is not an independently mutable record. It is snapshot-level, so
+per-upload transfer metrics belong in a completion envelope rather than the receipt.
 _Avoid_: Certificate, snapshot
 
 **Tombstone**:

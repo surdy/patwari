@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::{
     contract::{
-        Artifact, ArtifactInput, Capture, CaptureInput, Compression, Manifest, ManifestInput,
-        RegisterClientRequest,
+        Artifact, ArtifactInput, Capture, CaptureInput, Compression, CreateUploadRequest, Manifest,
+        ManifestInput, RegisterClientRequest,
     },
     error::ApiError,
 };
@@ -47,8 +47,32 @@ pub(crate) fn validate_client_request(request: &RegisterClientRequest) -> Result
     Ok(())
 }
 
-pub(crate) fn validate_idempotency_key(key: &str) -> Result<(), ApiError> {
-    validate_nonempty_text(key, MAX_IDEMPOTENCY_KEY_BYTES, "idempotency key is invalid")
+pub(crate) fn capture_id(request: &CreateUploadRequest) -> Result<&str, ApiError> {
+    let capture_id = match (&request.capture_id, &request.idempotency_key) {
+        (Some(capture_id), None | Some(_)) => capture_id,
+        (None, Some(idempotency_key)) => idempotency_key,
+        (None, None) => {
+            return Err(ApiError::invalid("capture identifier is required"));
+        }
+    };
+    if let (Some(capture_id), Some(idempotency_key)) =
+        (&request.capture_id, &request.idempotency_key)
+        && capture_id != idempotency_key
+    {
+        return Err(ApiError::invalid(
+            "capture_id and idempotency_key must be identical when both are supplied",
+        ));
+    }
+    validate_capture_identifier(capture_id)?;
+    Ok(capture_id)
+}
+
+pub(crate) fn validate_capture_identifier(capture_id: &str) -> Result<(), ApiError> {
+    validate_nonempty_text(
+        capture_id,
+        MAX_IDEMPOTENCY_KEY_BYTES,
+        "capture identifier is invalid",
+    )
 }
 
 pub(crate) fn normalize_manifest(
@@ -177,8 +201,9 @@ fn normalize_artifact(
         .expect("digest validation requires sha256 prefix");
     if let Some((size, compression)) = representations.get(stored_digest) {
         if *size != input.stored_size_bytes || *compression != input.compression {
-            return Err(ApiError::invalid(
-                "shared stored bytes must declare one unambiguous representation",
+            return Err(ApiError::conflict(
+                "blob_integrity_conflict",
+                "stored digest conflicts with immutable blob size or compression metadata",
             ));
         }
     } else {
@@ -221,6 +246,7 @@ fn normalize_capture(input: CaptureInput) -> Result<Capture, ApiError> {
         .map_err(|_| ApiError::internal())?;
     for value in [
         &input.source_cursor,
+        &input.source_state_hash,
         &input.project,
         &input.repository,
         &input.branch,
@@ -229,13 +255,36 @@ fn normalize_capture(input: CaptureInput) -> Result<Capture, ApiError> {
     ] {
         validate_optional_text(value.as_ref(), MAX_CONTEXT_VALUE_BYTES)?;
     }
+    if input.artifact_set_version == 0 {
+        return Err(ApiError::invalid(
+            "artifact set version must be a non-zero adapter contract version",
+        ));
+    }
+    if input.source_metadata.len() > MAX_METADATA_ENTRIES {
+        return Err(ApiError::invalid("source metadata has too many entries"));
+    }
+    for (key, value) in &input.source_metadata {
+        validate_nonempty_text(
+            key,
+            MAX_METADATA_KEY_BYTES,
+            "source metadata key is invalid",
+        )?;
+        validate_text(
+            value,
+            MAX_METADATA_VALUE_BYTES,
+            "source metadata value is invalid",
+        )?;
+    }
     Ok(Capture {
         captured_at,
         source_cursor: input.source_cursor,
+        source_state_hash: input.source_state_hash,
+        source_metadata: input.source_metadata,
         project: input.project,
         repository: input.repository,
         branch: input.branch,
         source_agent_version: input.source_agent_version,
+        artifact_set_version: input.artifact_set_version,
         munshi_version: input.munshi_version,
     })
 }

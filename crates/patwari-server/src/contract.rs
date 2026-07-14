@@ -27,7 +27,19 @@ pub struct ClientResponse {
 #[serde(deny_unknown_fields)]
 pub struct CreateUploadRequest {
     pub client_id: String,
-    pub idempotency_key: String,
+    /// A client-generated identifier for one durable capture observation.
+    ///
+    /// This is deliberately unrelated to the server-derived snapshot
+    /// fingerprint. Repeating a capture ID for the same client is
+    /// idempotent only when the canonical manifest is unchanged.
+    #[serde(default)]
+    pub capture_id: Option<String>,
+    /// Deprecated compatibility alias for `capture_id`.
+    ///
+    /// Supplying both names is allowed only when their values are identical,
+    /// so old and new clients cannot create an ambiguous capture identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     pub manifest: ManifestInput,
 }
 
@@ -35,6 +47,7 @@ pub struct CreateUploadRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UploadResponse {
     pub upload_id: String,
+    pub capture_id: String,
     pub session_id: String,
     pub status: UploadStatus,
     pub manifest_sha256: String,
@@ -48,12 +61,15 @@ pub struct UploadResponse {
     pub status_url: String,
     pub abandon_url: String,
     pub completion_url: String,
+    /// Becomes retrievable after successful completion.
+    pub capture_url: String,
 }
 
 /// The resumable-upload status document returned by `GET /uploads/{upload_id}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UploadStatusResponse {
     pub upload_id: String,
+    pub capture_id: String,
     pub session_id: String,
     pub status: UploadStatus,
     pub manifest_sha256: Option<String>,
@@ -62,6 +78,8 @@ pub struct UploadStatusResponse {
     pub status_url: String,
     pub abandon_url: String,
     pub completion_url: String,
+    /// Becomes retrievable after successful completion.
+    pub capture_url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,10 +172,16 @@ pub struct SessionInput {
 pub struct CaptureInput {
     pub captured_at: String,
     pub source_cursor: Option<String>,
+    pub source_state_hash: Option<String>,
+    #[serde(default)]
+    pub source_metadata: BTreeMap<String, String>,
     pub project: Option<String>,
     pub repository: Option<String>,
     pub branch: Option<String>,
     pub source_agent_version: Option<String>,
+    /// Versioned source-adapter artifact contract. New manifests must state
+    /// this explicitly because it participates in snapshot identity.
+    pub artifact_set_version: u16,
     pub munshi_version: Option<String>,
 }
 
@@ -166,11 +190,28 @@ pub struct CaptureInput {
 pub struct Capture {
     pub captured_at: String,
     pub source_cursor: Option<String>,
+    pub source_state_hash: Option<String>,
+    #[serde(default)]
+    pub source_metadata: BTreeMap<String, String>,
     pub project: Option<String>,
     pub repository: Option<String>,
     pub branch: Option<String>,
     pub source_agent_version: Option<String>,
+    /// Historical persisted manifests predate this required input field.
+    /// They are interpreted as the original adapter contract version.
+    #[serde(default = "default_artifact_set_version")]
+    pub artifact_set_version: u16,
     pub munshi_version: Option<String>,
+}
+
+/// The original source-adapter artifact contract version, implied for every
+/// manifest recorded before `artifact_set_version` became a required input
+/// field. Legacy upgrade and terminal-audit compatibility logic key off this
+/// constant rather than a bare literal.
+pub(crate) const LEGACY_ARTIFACT_SET_VERSION: u16 = 1;
+
+const fn default_artifact_set_version() -> u16 {
+    LEGACY_ARTIFACT_SET_VERSION
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -224,6 +265,8 @@ pub struct SnapshotResponse {
     pub artifact_count: u32,
     pub total_original_bytes: u64,
     pub total_stored_bytes: u64,
+    pub capture_count: u64,
+    pub captures_url: String,
     pub manifest: Manifest,
     pub artifacts: Vec<ArtifactResponse>,
 }
@@ -254,11 +297,60 @@ pub struct Receipt {
     pub artifact_count: u32,
     pub total_original_bytes: u64,
     pub total_stored_bytes: u64,
-    /// Stored payload bytes accepted for this upload attempt.
-    pub upload_transfer_bytes: u64,
-    /// Unique canonical blob bytes first persisted by this completion.
-    pub newly_persisted_physical_bytes: u64,
     pub completed_at: String,
+}
+
+/// Per-upload transfer facts. These intentionally are not receipt fields:
+/// distinct captures can resolve to one snapshot while transferring different
+/// stored representations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompletionTransfer {
+    pub upload_id: String,
+    pub capture_id: String,
+    pub upload_transfer_bytes: u64,
+    pub newly_persisted_physical_bytes: u64,
+}
+
+/// Durable provenance for one successfully archived client observation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureProvenance {
+    pub capture_record_id: String,
+    pub capture_id: String,
+    pub client_id: String,
+    pub session_id: String,
+    pub upload_id: String,
+    pub snapshot_id: String,
+    pub manifest_sha256: String,
+    pub source_captured_at: String,
+    pub source_cursor: Option<String>,
+    pub source_state_hash: Option<String>,
+    pub source_metadata: BTreeMap<String, String>,
+    pub project: Option<String>,
+    pub repository: Option<String>,
+    pub branch: Option<String>,
+    pub source_agent_version: Option<String>,
+    pub artifact_set_version: u16,
+    pub munshi_version: Option<String>,
+    pub server_received_at: String,
+    pub server_completed_at: String,
+    pub capture_url: String,
+}
+
+/// Completion keeps immutable snapshot evidence separate from mutable
+/// transfer facts and the successful capture's provenance.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompletionResponse {
+    pub receipt: Receipt,
+    pub transfer: CompletionTransfer,
+    pub capture: CaptureProvenance,
+}
+
+/// Focused provenance relation for one snapshot. This is intentionally not a
+/// general capture listing or pagination surface.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnapshotCapturesResponse {
+    pub snapshot_id: String,
+    pub captures: Vec<CaptureProvenance>,
 }
 
 #[derive(Clone, Debug, Serialize)]

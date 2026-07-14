@@ -8,12 +8,12 @@ use std::{
 use axum::{
     Json,
     body::Body,
-    extract::{Path as AxumPath, State, rejection::JsonRejection},
+    extract::{Path as AxumPath, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
 use http_body_util::BodyExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 use thiserror::Error;
@@ -29,17 +29,19 @@ use uuid::Uuid;
 use crate::{
     config::MAX_CHUNK_COUNT,
     contract::{
-        Artifact, ArtifactResponse, ClientResponse, Compression, CreateUploadRequest, Manifest,
-        Receipt, RegisterClientRequest, SessionInput, SnapshotResponse, UploadArtifactStatus,
-        UploadResponse, UploadStatus, UploadStatusResponse,
+        Artifact, ArtifactResponse, CaptureProvenance, ClientResponse, CompletionResponse,
+        CompletionTransfer, Compression, CreateUploadRequest, LEGACY_ARTIFACT_SET_VERSION,
+        Manifest, Receipt, RegisterClientRequest, SessionInput, SnapshotCapturesResponse,
+        SnapshotResponse, UploadArtifactStatus, UploadResponse, UploadStatus, UploadStatusResponse,
     },
     database::{self, format_time, now_rfc3339},
     error::{ApiError, classify_database_error, parse_json},
     service::{AppState, MaintenanceError},
     storage::StorageLayout,
     validation::{
-        ManifestLimits, manifest_totals, normalize_manifest, parse_uuid, to_sqlite_i64,
-        validate_client_request, validate_digest, validate_idempotency_key, validate_octet_stream,
+        ManifestLimits, capture_id, manifest_totals, normalize_manifest, parse_uuid, to_sqlite_i64,
+        validate_capture_identifier, validate_client_request, validate_digest,
+        validate_octet_stream,
     },
 };
 
@@ -48,6 +50,7 @@ const CHUNK_SHA256_HEADER: &str = "x-patwari-chunk-sha256";
 const CHUNK_LENGTH_HEADER: &str = "x-patwari-chunk-length";
 const LEGACY_EXPIRY_MARKER: &str = "1970-01-01T00:00:00Z";
 const MAX_SNAPSHOT_CHUNK_COUNT: u64 = 262_144;
+const SNAPSHOT_FINGERPRINT_VERSION: i64 = 1;
 
 /// The result of comparing a single immutable manifest to its normalized
 /// Artifact/Blob projection. This intentionally is not a full archive scan.
@@ -119,7 +122,7 @@ pub(crate) async fn create_upload(
 ) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
     let request = parse_json(payload)?;
     let client_id = parse_uuid(&request.client_id, "client identifier is not a UUID")?;
-    validate_idempotency_key(&request.idempotency_key)?;
+    let capture_id = capture_id(&request)?.to_owned();
     let manifest = normalize_manifest(
         request.manifest,
         ManifestLimits {
@@ -138,16 +141,15 @@ pub(crate) async fn create_upload(
     let expires_at =
         database::expiration_at(now, state.upload_expiry).map_err(|_| ApiError::internal())?;
 
-    // A caller may resume with the same idempotency key after a prior upload
-    // expired. Expire before looking up that key so it cannot pin a stale
-    // transfer attempt.
+    // A caller may retry a capture ID after a prior upload expired. Expire
+    // before looking up that ID so it cannot pin a stale transfer attempt.
     expire_uploads_at(&state, now)
         .await
         .map_err(|_| ApiError::internal())?;
     let created = persist_upload(
         &state,
         &client_id.to_string(),
-        &request.idempotency_key,
+        &capture_id,
         &manifest,
         canonical_json,
         &manifest_sha256,
@@ -204,7 +206,7 @@ struct CreatedUpload {
 async fn persist_upload(
     state: &AppState,
     client_id: &str,
-    idempotency_key: &str,
+    capture_id: &str,
     manifest: &Manifest,
     canonical_json: String,
     manifest_sha256: &str,
@@ -219,6 +221,15 @@ async fn persist_upload(
         .map_err(|_| ApiError::database())?;
     let session_id =
         get_or_create_session(&mut transaction, state, client_id, manifest, now).await?;
+    ensure_terminal_capture_reuse_is_equivalent(
+        &mut transaction,
+        &state.identity.owner_namespace,
+        client_id,
+        capture_id,
+        manifest,
+        manifest_sha256,
+    )
+    .await?;
     let upload_id = Uuid::now_v7().to_string();
     let initial_status = if layout.chunk_counts.iter().all(|count| *count == 0) {
         "artifact_uploaded"
@@ -230,20 +241,21 @@ async fn persist_upload(
 
     let insert = sqlx::query(
         "INSERT INTO uploads (
-            id, owner_namespace, session_id, client_id, idempotency_key, manifest_sha256, status,
+            id, owner_namespace, session_id, client_id, idempotency_key, capture_id,
+            manifest_sha256, status,
             created_at, chunk_size_bytes, chunk_count, declared_stored_size_bytes,
             declared_original_size_bytes, expires_at, artifact_count, total_stored_size_bytes,
             total_original_size_bytes
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+            ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
          )
-         ON CONFLICT(owner_namespace, client_id, idempotency_key) DO NOTHING",
+         ON CONFLICT(owner_namespace, client_id, capture_id) DO NOTHING",
     )
     .bind(&upload_id)
     .bind(&state.identity.owner_namespace)
     .bind(&session_id)
     .bind(client_id)
-    .bind(idempotency_key)
+    .bind(capture_id)
     .bind(manifest_sha256)
     .bind(initial_status)
     .bind(now)
@@ -276,11 +288,11 @@ async fn persist_upload(
     } else {
         let existing = sqlx::query_as::<_, ExistingUploadRow>(
             "SELECT id, manifest_sha256 FROM uploads
-             WHERE owner_namespace = ?1 AND client_id = ?2 AND idempotency_key = ?3",
+             WHERE owner_namespace = ?1 AND client_id = ?2 AND capture_id = ?3",
         )
         .bind(&state.identity.owner_namespace)
         .bind(client_id)
-        .bind(idempotency_key)
+        .bind(capture_id)
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| ApiError::database())?;
@@ -288,8 +300,8 @@ async fn persist_upload(
             && !legacy_manifest_equivalent(&mut transaction, &existing.id, manifest_sha256).await?
         {
             return Err(ApiError::conflict(
-                "idempotency_conflict",
-                "idempotency key was already used for a different manifest",
+                "capture_id_conflict",
+                "capture identifier was already used for a different manifest",
             ));
         }
         (existing.id, false)
@@ -302,6 +314,135 @@ async fn persist_upload(
         upload_id: persisted_id,
         was_created,
     })
+}
+
+async fn ensure_terminal_capture_reuse_is_equivalent(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner_namespace: &str,
+    client_id: &str,
+    capture_id: &str,
+    manifest: &Manifest,
+    manifest_sha256: &str,
+) -> Result<(), ApiError> {
+    let prior: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT manifest_sha256 FROM upload_audits
+         WHERE owner_namespace = ?1 AND client_id = ?2 AND capture_id = ?3
+         ORDER BY terminal_at DESC LIMIT 1",
+    )
+    .bind(owner_namespace)
+    .bind(client_id)
+    .bind(capture_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::database())?;
+    match prior {
+        None => Ok(()),
+        Some((Some(previous),)) => {
+            if previous == manifest_sha256
+                || legacy_manifest_digests(manifest)
+                    .iter()
+                    .any(|(_version, digest)| *digest == previous)
+            {
+                Ok(())
+            } else {
+                Err(ApiError::conflict(
+                    "capture_id_conflict",
+                    "capture identifier was already used for a different manifest",
+                ))
+            }
+        }
+        Some((None,)) => Err(ApiError::conflict(
+            "capture_id_conflict",
+            "capture identifier was used by a historical terminal upload with unknown manifest",
+        )),
+    }
+}
+
+/// Schema-shape versions terminal-audit reuse recognizes as equivalent to
+/// the current canonical manifest digest.
+///
+/// Terminal audits retain only the redacted `manifest_sha256`, never the
+/// manifest itself, so an audit created before `Capture` gained
+/// `source_state_hash`, `source_metadata`, and `artifact_set_version` holds a
+/// digest of a JSON shape the current server can no longer produce. Unlike
+/// active or completed uploads (which still have `manifests.canonical_json`
+/// and can be re-serialized and compared, see `legacy_manifest_equivalent`),
+/// there is nothing to re-serialize here: the legacy shape must instead be
+/// reconstructed from the *current* normalized manifest.
+///
+/// Each variant below is one deliberate, explicit compatibility rule for a
+/// prior schema shape. Adding a future schema change that alters canonical
+/// serialization should add another variant here rather than loosen this
+/// comparison to an arbitrary fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyManifestDigestVersion {
+    /// The `Capture` shape before `source_state_hash`, `source_metadata`,
+    /// and `artifact_set_version` existed: those fields are omitted
+    /// entirely, exactly as the pre-upgrade server serialized them.
+    PreCaptureProvenanceV1,
+}
+
+/// The pre-provenance `Capture` shape, matching the exact field set and
+/// order the server serialized before `source_state_hash`,
+/// `source_metadata`, and `artifact_set_version` were added.
+#[derive(Serialize)]
+struct LegacyCaptureV1<'a> {
+    captured_at: &'a str,
+    source_cursor: &'a Option<String>,
+    project: &'a Option<String>,
+    repository: &'a Option<String>,
+    branch: &'a Option<String>,
+    source_agent_version: &'a Option<String>,
+    munshi_version: &'a Option<String>,
+}
+
+/// The pre-provenance `Manifest` shape paired with `LegacyCaptureV1`.
+#[derive(Serialize)]
+struct LegacyManifestV1<'a> {
+    schema_version: u16,
+    session: &'a SessionInput,
+    capture: LegacyCaptureV1<'a>,
+    artifacts: &'a Vec<Artifact>,
+}
+
+/// Recomputes every legacy canonical digest the current manifest could still
+/// validly match.
+///
+/// A legacy shape is only produced when every field added after that shape
+/// holds exactly the value an old-format manifest implied (a present,
+/// non-default value means the caller is deliberately using a newer,
+/// semantically distinct capture, which must not be equated with a legacy
+/// one). This keeps the comparison a precise, versioned bridge rather than a
+/// weakening of conflict detection.
+fn legacy_manifest_digests(manifest: &Manifest) -> Vec<(LegacyManifestDigestVersion, String)> {
+    let mut digests = Vec::new();
+    let capture = &manifest.capture;
+    if capture.source_state_hash.is_none()
+        && capture.source_metadata.is_empty()
+        && capture.artifact_set_version == LEGACY_ARTIFACT_SET_VERSION
+    {
+        let legacy = LegacyManifestV1 {
+            schema_version: manifest.schema_version,
+            session: &manifest.session,
+            capture: LegacyCaptureV1 {
+                captured_at: &capture.captured_at,
+                source_cursor: &capture.source_cursor,
+                project: &capture.project,
+                repository: &capture.repository,
+                branch: &capture.branch,
+                source_agent_version: &capture.source_agent_version,
+                munshi_version: &capture.munshi_version,
+            },
+            artifacts: &manifest.artifacts,
+        };
+        if let Ok(json) = serde_json::to_vec(&legacy) {
+            digests.push((
+                LegacyManifestDigestVersion::PreCaptureProvenanceV1,
+                sha256_hex(&json),
+            ));
+        }
+    }
+    digests
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -869,18 +1010,19 @@ async fn terminalize_upload_locked(
     }
     sqlx::query(
         "INSERT INTO upload_audits (
-            upload_id, owner_namespace, client_id, session_id, declared_original_size_bytes,
+            upload_id, owner_namespace, client_id, capture_id, session_id, declared_original_size_bytes,
             declared_stored_size_bytes, chunk_size_bytes, chunk_count, created_at, terminal_at,
             terminal_reason, error_code, artifact_count, total_original_size_bytes,
-            total_stored_size_bytes
+            total_stored_size_bytes, manifest_sha256
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
          )
          ON CONFLICT(upload_id) DO NOTHING",
     )
     .bind(&upload.id)
     .bind(&upload.owner_namespace)
     .bind(&upload.client_id)
+    .bind(&upload.capture_id)
     .bind(&upload.session_id)
     .bind(upload.declared_original_size_bytes)
     .bind(upload.declared_stored_size_bytes)
@@ -893,6 +1035,7 @@ async fn terminalize_upload_locked(
     .bind(upload.artifact_count)
     .bind(upload.total_original_size_bytes)
     .bind(upload.total_stored_size_bytes)
+    .bind(&upload.manifest_sha256)
     .execute(&mut *transaction)
     .await
     .map_err(|_| ApiError::database())?;
@@ -997,7 +1140,9 @@ async fn active_upload_response(
         status_url: format!("/api/v1/uploads/{upload_id}"),
         abandon_url: format!("/api/v1/uploads/{upload_id}/abandon"),
         completion_url: format!("/api/v1/uploads/{upload_id}/complete"),
+        capture_url: format!("/api/v1/uploads/{upload_id}/capture"),
         upload_id: upload.id,
+        capture_id: upload.capture_id,
         session_id: upload.session_id,
         status: upload_status(&upload.status)?,
         manifest_sha256: digest_document_value(&upload.manifest_sha256),
@@ -1016,7 +1161,9 @@ async fn active_upload_status_response(
         status_url: format!("/api/v1/uploads/{}", upload.id),
         abandon_url: format!("/api/v1/uploads/{}/abandon", upload.id),
         completion_url: format!("/api/v1/uploads/{}/complete", upload.id),
+        capture_url: format!("/api/v1/uploads/{}/capture", upload.id),
         upload_id: upload.id.clone(),
+        capture_id: upload.capture_id.clone(),
         session_id: upload.session_id.clone(),
         status: upload_status(&upload.status)?,
         manifest_sha256: Some(digest_document_value(&upload.manifest_sha256)),
@@ -1031,7 +1178,7 @@ async fn audit_upload_response(
     upload_id: &str,
 ) -> Result<UploadStatusResponse, ApiError> {
     let audit = sqlx::query_as::<_, AuditUploadRow>(
-        "SELECT upload_id, session_id, chunk_size_bytes, terminal_reason
+        "SELECT upload_id, capture_id, session_id, chunk_size_bytes, terminal_reason
          FROM upload_audits WHERE upload_id = ?1",
     )
     .bind(upload_id)
@@ -1048,7 +1195,9 @@ async fn audit_upload_response(
         status_url: format!("/api/v1/uploads/{upload_id}"),
         abandon_url: format!("/api/v1/uploads/{upload_id}/abandon"),
         completion_url: format!("/api/v1/uploads/{upload_id}/complete"),
+        capture_url: format!("/api/v1/uploads/{upload_id}/capture"),
         upload_id: audit.upload_id,
+        capture_id: audit.capture_id,
         session_id: audit.session_id,
         status,
         manifest_sha256: None,
@@ -1140,16 +1289,20 @@ fn upload_status(status: &str) -> Result<UploadStatus, ApiError> {
     }
 }
 
+// The ordered verification, deduplication, promotion, and commit sequence is
+// intentionally visible together so storage safety and lock ordering are
+// auditable.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn complete_upload(
     AxumPath(upload_id): AxumPath<String>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Receipt>, ApiError> {
+) -> Result<Json<CompletionResponse>, ApiError> {
     let upload_id = parse_uuid(&upload_id, "upload identifier is not a UUID")?.to_string();
     let lock = state.upload_lock(&upload_id);
     let _guard = lock.lock().await;
     let upload = require_active_upload(&state, &upload_id).await?;
     if upload.status == "completed" {
-        return receipt_for_upload(&state, &upload_id).await.map(Json);
+        return completion_for_upload(&state, &upload_id).await.map(Json);
     }
 
     let manifest = get_upload_manifest(&state.database, &upload_id).await?;
@@ -1160,6 +1313,15 @@ pub(crate) async fn complete_upload(
     let (_, transfer_bytes) = manifest_totals(&manifest)?;
     let fingerprint = snapshot_fingerprint(&manifest)?;
 
+    // A semantic snapshot hit must not hide a contradiction in owner-scoped
+    // stored-representation metadata. Verification above establishes that the
+    // uploaded bytes are valid; this check establishes that a same-digest blob
+    // has one immutable size and compression declaration before deduplication.
+    if let Err(error) = ensure_blob_representations_compatible(&state, &prepared).await {
+        cleanup_prepared(&prepared).await;
+        return Err(error);
+    }
+
     // Fully verify every stored and original stream before deciding semantic
     // deduplication. A duplicate snapshot cannot be used to mask a corrupt
     // or incomplete artifact.
@@ -1167,10 +1329,16 @@ pub(crate) async fn complete_upload(
         find_snapshot_by_fingerprint(&state, &upload.session_id, &fingerprint).await?
     {
         cleanup_prepared(&prepared).await;
-        finalize_upload_for_existing_snapshot(&state, &upload_id, &snapshot_id, transfer_bytes)
-            .await?;
+        finalize_upload_for_existing_snapshot(
+            &state,
+            &upload,
+            &manifest,
+            &snapshot_id,
+            transfer_bytes,
+        )
+        .await?;
         let _ = state.storage.remove_upload_dir(&upload_id).await;
-        return receipt_for_upload(&state, &upload_id).await.map(Json);
+        return completion_for_upload(&state, &upload_id).await.map(Json);
     }
 
     let unique = unique_stored_artifacts(&prepared);
@@ -1180,17 +1348,29 @@ pub(crate) async fn complete_upload(
         .collect::<Vec<_>>();
     let blob_guards = acquire_blob_locks(&state, &digests).await;
 
+    if let Err(error) = ensure_blob_representations_compatible(&state, &prepared).await {
+        cleanup_prepared(&prepared).await;
+        drop(blob_guards);
+        return Err(error);
+    }
+
     // A completion with a different stored representation does not share a
     // blob lock with the winner, so recheck after obtaining this set's locks.
     if let Some(snapshot_id) =
         find_snapshot_by_fingerprint(&state, &upload.session_id, &fingerprint).await?
     {
         cleanup_prepared(&prepared).await;
-        finalize_upload_for_existing_snapshot(&state, &upload_id, &snapshot_id, transfer_bytes)
-            .await?;
+        finalize_upload_for_existing_snapshot(
+            &state,
+            &upload,
+            &manifest,
+            &snapshot_id,
+            transfer_bytes,
+        )
+        .await?;
         drop(blob_guards);
         let _ = state.storage.remove_upload_dir(&upload_id).await;
-        return receipt_for_upload(&state, &upload_id).await.map(Json);
+        return completion_for_upload(&state, &upload_id).await.map(Json);
     }
 
     let promotions = match promote_unique_blobs(&state, &unique).await {
@@ -1237,7 +1417,7 @@ pub(crate) async fn complete_upload(
     // upload-scoped leftovers that bootstrap removes; the snapshot and all
     // of its normalized artifact rows became visible in one transaction.
     let _ = state.storage.remove_upload_dir(&upload_id).await;
-    receipt_for_upload(&state, &upload_id).await.map(Json)
+    completion_for_upload(&state, &upload_id).await.map(Json)
 }
 
 fn validate_current_manifest_limits(state: &AppState, manifest: &Manifest) -> Result<(), ApiError> {
@@ -1599,11 +1779,17 @@ async fn find_snapshot_by_fingerprint(
 
 async fn finalize_upload_for_existing_snapshot(
     state: &AppState,
-    upload_id: &str,
+    upload: &ActiveUploadRow,
+    manifest: &Manifest,
     snapshot_id: &str,
     transfer_bytes: u64,
 ) -> Result<(), ApiError> {
     let now = now_rfc3339().map_err(|_| ApiError::internal())?;
+    let mut transaction = state
+        .database
+        .begin()
+        .await
+        .map_err(|error| classify_database_error(&error))?;
     let updated = sqlx::query(
         "UPDATE uploads
          SET status = 'completed', snapshot_id = ?1, completed_at = ?2,
@@ -1613,19 +1799,43 @@ async fn finalize_upload_for_existing_snapshot(
     .bind(snapshot_id)
     .bind(&now)
     .bind(to_sqlite_i64(transfer_bytes)?)
-    .bind(upload_id)
-    .execute(&state.database)
+    .bind(&upload.id)
+    .execute(&mut *transaction)
     .await
     .map_err(|error| classify_database_error(&error))?;
     if updated.rows_affected() == 1 {
+        let manifest_id: (String,) =
+            sqlx::query_as("SELECT id FROM manifests WHERE upload_id = ?1")
+                .bind(&upload.id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|_| ApiError::database())?;
+        insert_capture_provenance(
+            &mut transaction,
+            state,
+            upload,
+            manifest,
+            &manifest_id.0,
+            snapshot_id,
+            &now,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| classify_database_error(&error))?;
         return Ok(());
     }
     let current: Option<UploadRaceRow> =
         sqlx::query_as("SELECT status, snapshot_id FROM uploads WHERE id = ?1")
-            .bind(upload_id)
-            .fetch_optional(&state.database)
+            .bind(&upload.id)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(|_| ApiError::database())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| classify_database_error(&error))?;
     let already_completed_with_same_snapshot = current.is_some_and(|current| {
         current.status == "completed" && current.snapshot_id.as_deref() == Some(snapshot_id)
     });
@@ -1682,8 +1892,8 @@ async fn record_completed_upload(
     let snapshot_insert = sqlx::query(
         "INSERT INTO snapshots (
             id, owner_namespace, session_id, manifest_id, fingerprint_sha256, completed_at,
-            artifact_count, total_original_size_bytes, total_stored_size_bytes
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            artifact_count, total_original_size_bytes, total_stored_size_bytes, fingerprint_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(session_id, fingerprint_sha256) DO NOTHING",
     )
     .bind(&candidate_snapshot_id)
@@ -1697,6 +1907,7 @@ async fn record_completed_upload(
     )?)
     .bind(to_sqlite_i64(total_original_bytes)?)
     .bind(to_sqlite_i64(total_stored_bytes)?)
+    .bind(SNAPSHOT_FINGERPRINT_VERSION)
     .execute(&mut *transaction)
     .await
     .map_err(|_| ApiError::database())?;
@@ -1719,13 +1930,17 @@ async fn record_completed_upload(
         .await
         .map_err(|_| ApiError::database())?;
         cleanup_uncommitted_promotions(state, promotions).await?;
-        finalize_upload_for_existing_snapshot(state, upload_id, &winner.0, transfer_bytes).await?;
+        finalize_upload_for_existing_snapshot(state, upload, manifest, &winner.0, transfer_bytes)
+            .await?;
         return Ok(());
     }
 
     finalize_winning_snapshot(
         &mut transaction,
-        upload_id,
+        state,
+        upload,
+        manifest,
+        &manifest_id.0,
         &candidate_snapshot_id,
         prepared,
         &blob_ids,
@@ -1765,7 +1980,10 @@ async fn cleanup_uncommitted_promotions(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_winning_snapshot(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    upload_id: &str,
+    state: &AppState,
+    upload: &ActiveUploadRow,
+    manifest: &Manifest,
+    manifest_id: &str,
     snapshot_id: &str,
     prepared: &[PreparedArtifact],
     blob_ids: &HashMap<String, String>,
@@ -1809,16 +2027,26 @@ async fn finalize_winning_snapshot(
     .bind(now)
     .bind(to_sqlite_i64(transfer_bytes)?)
     .bind(to_sqlite_i64(newly_persisted_bytes)?)
-    .bind(upload_id)
+    .bind(&upload.id)
     .execute(&mut **transaction)
     .await
     .map_err(|error| classify_database_error(&error))?;
     if updated.rows_affected() == 1 {
+        insert_capture_provenance(
+            transaction,
+            state,
+            upload,
+            manifest,
+            manifest_id,
+            snapshot_id,
+            now,
+        )
+        .await?;
         return Ok(());
     }
     let current: Option<UploadRaceRow> =
         sqlx::query_as("SELECT status, snapshot_id FROM uploads WHERE id = ?1")
-            .bind(upload_id)
+            .bind(&upload.id)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(|_| ApiError::database())?;
@@ -1833,6 +2061,106 @@ async fn finalize_winning_snapshot(
             "upload state changed while completion was requested",
         ))
     }
+}
+
+async fn insert_capture_provenance(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    state: &AppState,
+    upload: &ActiveUploadRow,
+    manifest: &Manifest,
+    manifest_id: &str,
+    snapshot_id: &str,
+    completed_at: &str,
+) -> Result<(), ApiError> {
+    let metadata_json = serde_json::to_string(&manifest.capture.source_metadata)
+        .map_err(|_| ApiError::internal())?;
+    let inserted = sqlx::query(
+        "INSERT INTO captures (
+            id, owner_namespace, capture_id, session_id, client_id, upload_id, manifest_id,
+            snapshot_id, source_captured_at, source_cursor, source_state_hash,
+            source_metadata_json, project, repository, branch, source_agent_version,
+            artifact_set_version, munshi_version, server_received_at, server_completed_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+            ?17, ?18, ?19, ?20
+         )
+         ON CONFLICT(upload_id) DO NOTHING",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&state.identity.owner_namespace)
+    .bind(&upload.capture_id)
+    .bind(&upload.session_id)
+    .bind(&upload.client_id)
+    .bind(&upload.id)
+    .bind(manifest_id)
+    .bind(snapshot_id)
+    .bind(&manifest.capture.captured_at)
+    .bind(&manifest.capture.source_cursor)
+    .bind(&manifest.capture.source_state_hash)
+    .bind(metadata_json)
+    .bind(&manifest.capture.project)
+    .bind(&manifest.capture.repository)
+    .bind(&manifest.capture.branch)
+    .bind(&manifest.capture.source_agent_version)
+    .bind(i64::from(manifest.capture.artifact_set_version))
+    .bind(&manifest.capture.munshi_version)
+    .bind(&upload.created_at)
+    .bind(completed_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::database())?;
+    if inserted.rows_affected() == 1 {
+        return Ok(());
+    }
+
+    let existing: Option<(String, String)> =
+        sqlx::query_as("SELECT upload_id, snapshot_id FROM captures WHERE upload_id = ?1")
+            .bind(&upload.id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| ApiError::database())?;
+    if existing.is_some_and(|existing| existing.0 == upload.id && existing.1 == snapshot_id) {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "capture_provenance_conflict",
+            "capture provenance conflicts with an existing completed capture",
+        ))
+    }
+}
+
+async fn ensure_blob_representations_compatible(
+    state: &AppState,
+    prepared: &[PreparedArtifact],
+) -> Result<(), ApiError> {
+    for prepared_artifact in unique_stored_artifacts(prepared) {
+        let expected_size = to_sqlite_i64(prepared_artifact.artifact.stored_size_bytes)?;
+        let expected_compression = compression_name(prepared_artifact.artifact.compression);
+        let existing: Option<(i64, String)> = sqlx::query_as(
+            "SELECT stored_size_bytes, compression FROM blobs
+             WHERE owner_namespace = ?1 AND stored_sha256 = ?2",
+        )
+        .bind(&state.identity.owner_namespace)
+        .bind(digest_storage_value(
+            &prepared_artifact.artifact.stored_sha256,
+        ))
+        .fetch_optional(&state.database)
+        .await
+        .map_err(|_| ApiError::database())?;
+        if existing.is_some_and(|existing| {
+            existing.0 != expected_size || existing.1 != expected_compression
+        }) {
+            return Err(blob_integrity_conflict());
+        }
+    }
+    Ok(())
+}
+
+const fn blob_integrity_conflict() -> ApiError {
+    ApiError::conflict(
+        "blob_integrity_conflict",
+        "stored digest conflicts with immutable blob size or compression metadata",
+    )
 }
 
 async fn get_or_create_blob(
@@ -1869,10 +2197,7 @@ async fn get_or_create_blob(
     if row.stored_size_bytes != to_sqlite_i64(artifact.stored_size_bytes)?
         || row.compression != compression_name(artifact.compression)
     {
-        return Err(ApiError::conflict(
-            "blob_representation_conflict",
-            "stored bytes are already associated with a different representation",
-        ));
+        return Err(blob_integrity_conflict());
     }
     Ok(row.id)
 }
@@ -2084,20 +2409,14 @@ async fn is_regular_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
-fn snapshot_fingerprint(manifest: &Manifest) -> Result<String, ApiError> {
+pub(crate) fn snapshot_fingerprint(manifest: &Manifest) -> Result<String, ApiError> {
     #[derive(Serialize)]
     struct Fingerprint<'a> {
+        version: u16,
         schema_version: u16,
         session: &'a SessionInput,
         capture: StableCapture<'a>,
         artifacts: Vec<OriginalArtifact<'a>>,
-    }
-    #[derive(Serialize)]
-    struct LegacySingletonFingerprint<'a> {
-        schema_version: u16,
-        session: &'a SessionInput,
-        capture: StableCapture<'a>,
-        artifact: OriginalArtifact<'a>,
     }
     #[derive(Serialize)]
     struct StableCapture<'a> {
@@ -2105,6 +2424,7 @@ fn snapshot_fingerprint(manifest: &Manifest) -> Result<String, ApiError> {
         repository: &'a Option<String>,
         branch: &'a Option<String>,
         source_agent_version: &'a Option<String>,
+        artifact_set_version: u16,
     }
     #[derive(Serialize)]
     struct OriginalArtifact<'a> {
@@ -2118,25 +2438,8 @@ fn snapshot_fingerprint(manifest: &Manifest) -> Result<String, ApiError> {
         repository: &manifest.capture.repository,
         branch: &manifest.capture.branch,
         source_agent_version: &manifest.capture.source_agent_version,
+        artifact_set_version: manifest.capture.artifact_set_version,
     };
-    if let [artifact] = manifest.artifacts.as_slice() {
-        // v2/v3 databases used this singleton fingerprint document. Retaining
-        // it for a one-artifact canonical v1 manifest lets a migrated archive
-        // continue to semantically deduplicate its historical snapshots.
-        let fingerprint = LegacySingletonFingerprint {
-            schema_version: manifest.schema_version,
-            session: &manifest.session,
-            capture,
-            artifact: OriginalArtifact {
-                logical_path: &artifact.logical_path,
-                original_size_bytes: artifact.original_size_bytes,
-                original_sha256: &artifact.original_sha256,
-            },
-        };
-        return serde_json::to_vec(&fingerprint)
-            .map(|value| sha256_hex(&value))
-            .map_err(|_| ApiError::internal());
-    }
     let mut artifacts = manifest
         .artifacts
         .iter()
@@ -2148,6 +2451,7 @@ fn snapshot_fingerprint(manifest: &Manifest) -> Result<String, ApiError> {
         .collect::<Vec<_>>();
     artifacts.sort_unstable_by(|left, right| left.logical_path.cmp(right.logical_path));
     let fingerprint = Fingerprint {
+        version: u16::try_from(SNAPSHOT_FINGERPRINT_VERSION).map_err(|_| ApiError::internal())?,
         schema_version: manifest.schema_version,
         session: &manifest.session,
         capture,
@@ -2222,8 +2526,7 @@ async fn receipt_for_upload(state: &AppState, upload_id: &str) -> Result<Receipt
     let row = sqlx::query_as::<_, ReceiptRow>(
         "SELECT s.id, s.session_id, s.fingerprint_sha256, s.completed_at,
                 m.sha256 AS manifest_sha256, s.artifact_count,
-                s.total_original_size_bytes, s.total_stored_size_bytes,
-                u.transfer_bytes, u.newly_persisted_bytes
+                s.total_original_size_bytes, s.total_stored_size_bytes
          FROM uploads u
          JOIN snapshots s ON s.id = u.snapshot_id
          JOIN manifests m ON m.id = s.manifest_id
@@ -2235,7 +2538,7 @@ async fn receipt_for_upload(state: &AppState, upload_id: &str) -> Result<Receipt
     .map_err(|_| ApiError::database())?
     .ok_or_else(|| ApiError::not_found("snapshot_not_found", "snapshot was not found"))?;
     Ok(Receipt {
-        receipt_version: 1,
+        receipt_version: 2,
         archive_instance_id: state.identity.archive_instance_id.clone(),
         owner_namespace: state.identity.owner_namespace.clone(),
         snapshot_id: row.id,
@@ -2247,11 +2550,186 @@ async fn receipt_for_upload(state: &AppState, upload_id: &str) -> Result<Receipt
             .map_err(|_| ApiError::internal())?,
         total_stored_bytes: u64::try_from(row.total_stored_size_bytes)
             .map_err(|_| ApiError::internal())?,
-        upload_transfer_bytes: u64::try_from(row.transfer_bytes)
-            .map_err(|_| ApiError::internal())?,
-        newly_persisted_physical_bytes: u64::try_from(row.newly_persisted_bytes)
-            .map_err(|_| ApiError::internal())?,
         completed_at: row.completed_at,
+    })
+}
+
+async fn completion_for_upload(
+    state: &AppState,
+    upload_id: &str,
+) -> Result<CompletionResponse, ApiError> {
+    let receipt = receipt_for_upload(state, upload_id).await?;
+    let transfer = sqlx::query_as::<_, CompletionTransferRow>(
+        "SELECT id, capture_id, transfer_bytes, newly_persisted_bytes
+         FROM uploads WHERE id = ?1 AND status = 'completed'",
+    )
+    .bind(upload_id)
+    .fetch_optional(&state.database)
+    .await
+    .map_err(|_| ApiError::database())?
+    .ok_or_else(|| ApiError::not_found("upload_not_found", "upload was not found"))?;
+    let capture = capture_for_upload(&state.database, upload_id).await?;
+    Ok(CompletionResponse {
+        receipt,
+        transfer: CompletionTransfer {
+            upload_id: transfer.id,
+            capture_id: transfer.capture_id,
+            upload_transfer_bytes: u64::try_from(transfer.transfer_bytes)
+                .map_err(|_| ApiError::internal())?,
+            newly_persisted_physical_bytes: u64::try_from(transfer.newly_persisted_bytes)
+                .map_err(|_| ApiError::internal())?,
+        },
+        capture,
+    })
+}
+
+pub(crate) async fn get_capture_by_upload(
+    AxumPath(upload_id): AxumPath<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CaptureProvenance>, ApiError> {
+    let upload_id = parse_uuid(&upload_id, "upload identifier is not a UUID")?.to_string();
+    capture_for_upload(&state.database, &upload_id)
+        .await
+        .map(Json)
+}
+
+pub(crate) async fn get_capture(
+    AxumPath(capture_record_id): AxumPath<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CaptureProvenance>, ApiError> {
+    let capture_record_id = parse_uuid(
+        &capture_record_id,
+        "capture record identifier is not a UUID",
+    )?
+    .to_string();
+    let query = format!("{} WHERE c.id = ?1", capture_select_sql());
+    capture_from_row(
+        sqlx::query_as::<_, CaptureRow>(&query)
+            .bind(&capture_record_id)
+            .fetch_optional(&state.database)
+            .await
+            .map_err(|_| ApiError::database())?
+            .ok_or_else(|| ApiError::not_found("capture_not_found", "capture was not found"))?,
+    )
+    .map(Json)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CaptureLookup {
+    client_id: String,
+    capture_id: String,
+}
+
+/// Retrieves one capture by the pair that gives a client-generated capture
+/// ID its owner-local meaning. A bare client capture ID is intentionally not
+/// a global key because different clients may independently generate it.
+pub(crate) async fn get_capture_by_client(
+    State(state): State<Arc<AppState>>,
+    Query(lookup): Query<CaptureLookup>,
+) -> Result<Json<CaptureProvenance>, ApiError> {
+    let client_id = parse_uuid(&lookup.client_id, "client identifier is not a UUID")?.to_string();
+    validate_capture_identifier(&lookup.capture_id)?;
+    let query = format!(
+        "{} WHERE c.client_id = ?1 AND c.capture_id = ?2",
+        capture_select_sql()
+    );
+    capture_from_row(
+        sqlx::query_as::<_, CaptureRow>(&query)
+            .bind(client_id)
+            .bind(lookup.capture_id)
+            .fetch_optional(&state.database)
+            .await
+            .map_err(|_| ApiError::database())?
+            .ok_or_else(|| ApiError::not_found("capture_not_found", "capture was not found"))?,
+    )
+    .map(Json)
+}
+
+pub(crate) async fn get_snapshot_captures(
+    AxumPath(snapshot_id): AxumPath<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SnapshotCapturesResponse>, ApiError> {
+    let snapshot_id = parse_uuid(&snapshot_id, "snapshot identifier is not a UUID")?.to_string();
+    let snapshot_exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM snapshots WHERE id = ?1")
+        .bind(&snapshot_id)
+        .fetch_optional(&state.database)
+        .await
+        .map_err(|_| ApiError::database())?;
+    if snapshot_exists.is_none() {
+        return Err(ApiError::not_found(
+            "snapshot_not_found",
+            "snapshot was not found",
+        ));
+    }
+    let rows = sqlx::query_as::<_, CaptureRow>(&format!(
+        "{} WHERE c.snapshot_id = ?1 ORDER BY c.server_completed_at, c.id",
+        capture_select_sql()
+    ))
+    .bind(&snapshot_id)
+    .fetch_all(&state.database)
+    .await
+    .map_err(|_| ApiError::database())?;
+    let captures = rows
+        .into_iter()
+        .map(capture_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(SnapshotCapturesResponse {
+        snapshot_id,
+        captures,
+    }))
+}
+
+async fn capture_for_upload(
+    database: &SqlitePool,
+    upload_id: &str,
+) -> Result<CaptureProvenance, ApiError> {
+    capture_from_row(
+        sqlx::query_as::<_, CaptureRow>(&format!(
+            "{} WHERE c.upload_id = ?1",
+            capture_select_sql()
+        ))
+        .bind(upload_id)
+        .fetch_optional(database)
+        .await
+        .map_err(|_| ApiError::database())?
+        .ok_or_else(|| ApiError::not_found("capture_not_found", "capture was not found"))?,
+    )
+}
+
+fn capture_select_sql() -> &'static str {
+    "SELECT c.id, c.capture_id, c.client_id, c.session_id, c.upload_id, c.snapshot_id,
+            m.sha256 AS manifest_sha256, c.source_captured_at, c.source_cursor,
+            c.source_state_hash, c.source_metadata_json, c.project, c.repository, c.branch,
+            c.source_agent_version, c.artifact_set_version, c.munshi_version,
+            c.server_received_at, c.server_completed_at
+     FROM captures c JOIN manifests m ON m.id = c.manifest_id"
+}
+
+fn capture_from_row(row: CaptureRow) -> Result<CaptureProvenance, ApiError> {
+    let source_metadata =
+        serde_json::from_str(&row.source_metadata_json).map_err(|_| ApiError::internal())?;
+    Ok(CaptureProvenance {
+        capture_url: format!("/api/v1/captures/{}", row.id),
+        capture_record_id: row.id,
+        capture_id: row.capture_id,
+        client_id: row.client_id,
+        session_id: row.session_id,
+        upload_id: row.upload_id,
+        snapshot_id: row.snapshot_id,
+        manifest_sha256: digest_document_value(&row.manifest_sha256),
+        source_captured_at: row.source_captured_at,
+        source_cursor: row.source_cursor,
+        source_state_hash: row.source_state_hash,
+        source_metadata,
+        project: row.project,
+        repository: row.repository,
+        branch: row.branch,
+        source_agent_version: row.source_agent_version,
+        artifact_set_version: u16::try_from(row.artifact_set_version)
+            .map_err(|_| ApiError::internal())?,
+        munshi_version: row.munshi_version,
+        server_received_at: row.server_received_at,
+        server_completed_at: row.server_completed_at,
     })
 }
 
@@ -2262,7 +2740,8 @@ async fn snapshot_response(
     let row = sqlx::query_as::<_, SnapshotRow>(
         "SELECT s.id, s.session_id, s.fingerprint_sha256, s.completed_at,
                 s.artifact_count, s.total_original_size_bytes, s.total_stored_size_bytes,
-                m.sha256 AS manifest_sha256, m.canonical_json
+                m.sha256 AS manifest_sha256, m.canonical_json,
+                (SELECT COUNT(*) FROM captures c WHERE c.snapshot_id = s.id) AS capture_count
          FROM snapshots s JOIN manifests m ON m.id = s.manifest_id
          WHERE s.id = ?1",
     )
@@ -2300,6 +2779,8 @@ async fn snapshot_response(
             .map_err(|_| ApiError::internal())?,
         total_stored_bytes: u64::try_from(row.total_stored_size_bytes)
             .map_err(|_| ApiError::internal())?,
+        capture_count: u64::try_from(row.capture_count).map_err(|_| ApiError::internal())?,
+        captures_url: format!("/api/v1/snapshots/{snapshot_id}/captures"),
         manifest,
         artifacts,
     })
@@ -2412,8 +2893,8 @@ async fn get_active_upload(
     upload_id: &str,
 ) -> Result<Option<ActiveUploadRow>, ApiError> {
     sqlx::query_as(
-        "SELECT id, owner_namespace, session_id, client_id, manifest_sha256, status,
-                created_at, chunk_size_bytes, chunk_count, declared_stored_size_bytes,
+        "SELECT id, owner_namespace, session_id, client_id, capture_id, manifest_sha256, status,
+                snapshot_id, created_at, completed_at, chunk_size_bytes, chunk_count, declared_stored_size_bytes,
                 declared_original_size_bytes, expires_at, artifact_count,
                 total_stored_size_bytes, total_original_size_bytes
          FROM uploads WHERE id = ?1",
@@ -2496,9 +2977,12 @@ struct ActiveUploadRow {
     owner_namespace: String,
     session_id: String,
     client_id: String,
+    capture_id: String,
     manifest_sha256: String,
     status: String,
+    snapshot_id: Option<String>,
     created_at: String,
+    completed_at: Option<String>,
     chunk_size_bytes: i64,
     chunk_count: i64,
     declared_stored_size_bytes: i64,
@@ -2532,6 +3016,7 @@ struct ChunkRow {
 #[derive(FromRow)]
 struct AuditUploadRow {
     upload_id: String,
+    capture_id: String,
     session_id: String,
     chunk_size_bytes: i64,
     terminal_reason: String,
@@ -2560,8 +3045,37 @@ struct ReceiptRow {
     artifact_count: i64,
     total_original_size_bytes: i64,
     total_stored_size_bytes: i64,
+}
+
+#[derive(FromRow)]
+struct CompletionTransferRow {
+    id: String,
+    capture_id: String,
     transfer_bytes: i64,
     newly_persisted_bytes: i64,
+}
+
+#[derive(FromRow)]
+struct CaptureRow {
+    id: String,
+    capture_id: String,
+    client_id: String,
+    session_id: String,
+    upload_id: String,
+    snapshot_id: String,
+    manifest_sha256: String,
+    source_captured_at: String,
+    source_cursor: Option<String>,
+    source_state_hash: Option<String>,
+    source_metadata_json: String,
+    project: Option<String>,
+    repository: Option<String>,
+    branch: Option<String>,
+    source_agent_version: Option<String>,
+    artifact_set_version: i64,
+    munshi_version: Option<String>,
+    server_received_at: String,
+    server_completed_at: String,
 }
 
 #[derive(FromRow)]
@@ -2575,6 +3089,7 @@ struct SnapshotRow {
     total_original_size_bytes: i64,
     total_stored_size_bytes: i64,
     canonical_json: String,
+    capture_count: i64,
 }
 
 #[derive(FromRow)]
@@ -2602,6 +3117,8 @@ struct DownloadRow {
 pub(crate) async fn recover_uploads(state: &AppState) -> Result<(), MaintenanceError> {
     upgrade_upload_artifact_rows(state).await?;
     upgrade_legacy_uploads(state).await?;
+    upgrade_snapshot_fingerprints(state).await?;
+    backfill_completed_capture_provenance(state).await?;
     let uploads = sqlx::query_as::<_, RecoveryUploadRow>("SELECT id, status FROM uploads")
         .fetch_all(&state.database)
         .await
@@ -2637,6 +3154,98 @@ pub(crate) async fn recover_uploads(state: &AppState) -> Result<(), MaintenanceE
             .map_err(|_| MaintenanceError::Operation)?;
     }
     recover_unreferenced_blobs(state).await?;
+    Ok(())
+}
+
+#[derive(FromRow)]
+struct SnapshotFingerprintUpgradeRow {
+    id: String,
+    canonical_json: String,
+}
+
+/// Recalculate only pre-provenance fingerprints. Snapshot IDs and canonical
+/// manifest bytes remain untouched so historical receipts stay reissuable.
+async fn upgrade_snapshot_fingerprints(state: &AppState) -> Result<(), MaintenanceError> {
+    let snapshots = sqlx::query_as::<_, SnapshotFingerprintUpgradeRow>(
+        "SELECT s.id, m.canonical_json
+         FROM snapshots s JOIN manifests m ON m.id = s.manifest_id
+         WHERE s.fingerprint_version = 0",
+    )
+    .fetch_all(&state.database)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+    for snapshot in snapshots {
+        let manifest: Manifest = serde_json::from_str(&snapshot.canonical_json)
+            .map_err(|_| MaintenanceError::Operation)?;
+        let fingerprint =
+            snapshot_fingerprint(&manifest).map_err(|_| MaintenanceError::Operation)?;
+        sqlx::query(
+            "UPDATE snapshots
+             SET fingerprint_sha256 = ?1, fingerprint_version = ?2
+             WHERE id = ?3 AND fingerprint_version = 0",
+        )
+        .bind(fingerprint)
+        .bind(SNAPSHOT_FINGERPRINT_VERSION)
+        .bind(&snapshot.id)
+        .execute(&state.database)
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+    }
+    Ok(())
+}
+
+async fn backfill_completed_capture_provenance(state: &AppState) -> Result<(), MaintenanceError> {
+    let upload_ids = sqlx::query_as::<_, (String,)>(
+        "SELECT u.id
+         FROM uploads u LEFT JOIN captures c ON c.upload_id = u.id
+         WHERE u.status = 'completed' AND c.id IS NULL",
+    )
+    .fetch_all(&state.database)
+    .await
+    .map_err(|_| MaintenanceError::Operation)?;
+    for (upload_id,) in upload_ids {
+        let upload = get_active_upload(&state.database, &upload_id)
+            .await
+            .map_err(|_| MaintenanceError::Operation)?
+            .ok_or(MaintenanceError::Operation)?;
+        let manifest = get_upload_manifest(&state.database, &upload_id)
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+        let snapshot_id = upload
+            .snapshot_id
+            .as_deref()
+            .ok_or(MaintenanceError::Operation)?;
+        let completed_at = upload
+            .completed_at
+            .as_deref()
+            .ok_or(MaintenanceError::Operation)?;
+        let manifest_id: (String,) =
+            sqlx::query_as("SELECT id FROM manifests WHERE upload_id = ?1")
+                .bind(&upload_id)
+                .fetch_one(&state.database)
+                .await
+                .map_err(|_| MaintenanceError::Operation)?;
+        let mut transaction = state
+            .database
+            .begin()
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+        insert_capture_provenance(
+            &mut transaction,
+            state,
+            &upload,
+            &manifest,
+            &manifest_id.0,
+            snapshot_id,
+            completed_at,
+        )
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| MaintenanceError::Operation)?;
+    }
     Ok(())
 }
 

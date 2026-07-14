@@ -325,8 +325,18 @@ impl Service {
                 post(ingestion::complete_upload),
             )
             .route(
+                "/uploads/{upload_id}/capture",
+                get(ingestion::get_capture_by_upload),
+            )
+            .route("/captures", get(ingestion::get_capture_by_client))
+            .route("/captures/{capture_record_id}", get(ingestion::get_capture))
+            .route(
                 "/snapshots/{snapshot_id}",
                 get(ingestion::get_snapshot),
+            )
+            .route(
+                "/snapshots/{snapshot_id}/captures",
+                get(ingestion::get_snapshot_captures),
             )
             .route(
                 "/artifacts/{artifact_id}/content",

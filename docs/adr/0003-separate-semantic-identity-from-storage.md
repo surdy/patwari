@@ -1,7 +1,9 @@
 # Separate semantic snapshot identity from storage representation
 
-Patwari identifies a snapshot from stable capture context and the canonical logical-path-ordered set
-of verified original artifact content, while stored compressed bytes are represented by owner-scoped
-blobs. Tracking original and stored hashes separately allows compression settings and repeated
-captures to change without inventing new session states, while still supporting exact transfer
-verification and blob deduplication.
+Patwari identifies a snapshot within a session from stable capture context (project, repository,
+branch, source-agent version, and artifact-set version) and the canonical logical-path-ordered set
+of verified original artifact content. Stored compressed bytes are represented by owner-scoped blobs.
+Tracking original and stored hashes separately allows compression settings and repeated captures to
+change without inventing new session states, while still supporting exact transfer verification and
+blob deduplication. Client/capture IDs, source and server times, source cursor/state hash, Munshi
+version, opaque source metadata, and transfer metrics are provenance rather than snapshot identity.
