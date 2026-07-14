@@ -39,6 +39,38 @@ Restarting with the same `PATWARI_DATA_DIR` retains the owner namespace and arch
 only after SQLite accepts a query and every storage directory accepts a write-and-remove probe; it
 returns `503` otherwise.
 
+## Deployment, backup, and recovery
+
+The production image is defined by [`Containerfile`](Containerfile), and the
+quadhost Quadlet template, immutable-image installer, and environment example
+live in [`deploy/quadhost/`](deploy/quadhost/). The host listener is
+deliberately restricted to `192.168.16.169:8787`; v1 has no authentication, so
+it must remain on a trusted LAN and never be published on `0.0.0.0`.
+
+Use the archive-only maintenance CLI for a consistent online backup:
+
+```sh
+PATWARI_DATA_DIR=/var/lib/patwari-volume/data patwari-server backup create --output /backups/patwari-20260714
+patwari-server backup verify /backups/patwari-20260714
+patwari-server backup restore /backups/patwari-20260714 --data-dir /empty/patwari-data
+```
+
+Backup creation gates API work and integrity scans across processes, refuses
+active uploads, uses SQLite's online backup API, inventories authoritative
+Blob rows in deterministic digest order, hashes copied blobs, and atomically
+finalizes a self-contained directory. Verification checks the manifest,
+database, blob inventory and hashes, then boots a staged copy and runs the
+full integrity scanner. Restore verifies before touching its destination,
+refuses a non-empty destination, stages atomically, preserves archive
+identity, and scans again.
+
+The persistent archive volume and local backup directory are **not**
+disposable cache. External replication of verified finalized backup
+directories to independent storage is the durability boundary. See
+[`docs/operations/quadhost.md`](docs/operations/quadhost.md) for deployment,
+health checks, schedules, SELinux, update/rollback, trusted-network, and
+clean-host disaster-recovery procedures.
+
 Configuration is environment-based and bounded by default:
 
 | Variable | Default | Purpose |
@@ -144,7 +176,7 @@ recorded in [`docs/adr/`](docs/adr/).
 | Initial deployment | Single-user Podman Quadlet on quadhost |
 | Metadata store | SQLite |
 | Blob store | Dedicated local filesystem volume |
-| Additional backups | Managed outside Patwari at the filesystem/host level |
+| Additional backups | Patwari creates verified archive-only backup sets; external filesystem replication is the durability boundary |
 | Archive representation | Versioned manifest plus individually compressed files |
 | Source cleanup | Manual, previewable Munshi command only |
 | Initial source | GitHub Copilot CLI through Munshi |

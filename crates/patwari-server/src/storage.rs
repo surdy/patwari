@@ -91,6 +91,13 @@ impl StorageLayout {
             .join(stored_sha256)
     }
 
+    /// Directory reserved for maintenance coordination and local staging.
+    /// It is deliberately part of the persistent data volume so independent
+    /// server and CLI processes coordinate through the same lock file.
+    pub(crate) fn maintenance_dir(&self) -> &Path {
+        &self.maintenance
+    }
+
     pub(crate) async fn ensure_chunk_dir(
         &self,
         upload_id: &str,

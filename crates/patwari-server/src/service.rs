@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     error_handling::HandleErrorLayer,
+    middleware,
     routing::{delete, get, post, put},
 };
 use sqlx::SqlitePool;
@@ -18,7 +19,7 @@ use tracing::Level;
 use crate::{
     config::{Config, ConfigError},
     database::{self},
-    deletion, health, ingestion, integrity, retrieval,
+    deletion, health, ingestion, integrity, maintenance, retrieval,
     storage::StorageLayout,
 };
 
@@ -380,8 +381,14 @@ impl Service {
         recover_uploads: bool,
     ) -> Result<(Self, ArchiveIdentity), BootstrapError> {
         config.validate().map_err(BootstrapError::Configuration)?;
+        let startup_maintenance_permit =
+            maintenance::SharedFilePermit::acquire(&config.data_dir.join("maintenance"))
+                .map_err(|_| BootstrapError::Recovery)?;
         let storage = StorageLayout::create(&config.data_dir).await?;
         let (database, identity) = database::connect(config).await?;
+        maintenance::ensure_not_active(&database)
+            .await
+            .map_err(|_| BootstrapError::Recovery)?;
         let chunk_size_bytes = u64::try_from(config.chunk_size_bytes)
             .map_err(|_| BootstrapError::Configuration(ConfigError::InvalidChunkSize))?;
         let state = Arc::new(AppState {
@@ -417,6 +424,7 @@ impl Service {
                 .await
                 .map_err(|_| BootstrapError::Recovery)?;
         }
+        drop(startup_maintenance_permit);
 
         Ok((Self { state }, identity))
     }
@@ -510,7 +518,14 @@ impl Service {
                             })
                             .on_response(DefaultOnResponse::new().level(Level::INFO)),
                     ),
-            );
+            )
+            // This wraps every API route because upload-status GET can
+            // terminalize expired temporary state. Health endpoints remain
+            // available while an archive backup is pending or running.
+            .layer(middleware::from_fn_with_state(
+                self.state.clone(),
+                maintenance::gate_api_requests,
+            ));
 
         Router::new()
             .route("/healthz", get(health::liveness))
@@ -529,6 +544,12 @@ impl Service {
     /// Returns an error when expiry maintenance cannot safely update metadata or
     /// remove temporary upload storage.
     pub async fn expire_uploads(&self) -> Result<usize, MaintenanceError> {
+        let _maintenance_permit = maintenance::SharedPermit::acquire(
+            &self.state.database,
+            self.state.storage.maintenance_dir(),
+        )
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
         ingestion::expire_uploads_at(&self.state, time::OffsetDateTime::now_utc()).await
     }
 
@@ -554,6 +575,12 @@ impl Service {
     pub async fn collect_blob_garbage(
         &self,
     ) -> Result<crate::contract::BlobGcResponse, MaintenanceError> {
+        let _maintenance_permit = maintenance::SharedPermit::acquire(
+            &self.state.database,
+            self.state.storage.maintenance_dir(),
+        )
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
         deletion::collect_orphaned_blobs_at(&self.state, time::OffsetDateTime::now_utc()).await
     }
 
@@ -570,6 +597,12 @@ impl Service {
     pub async fn verify_integrity(
         &self,
     ) -> Result<crate::contract::IntegrityReport, IntegrityScanError> {
+        let _maintenance_permit = maintenance::SharedPermit::acquire(
+            &self.state.database,
+            self.state.storage.maintenance_dir(),
+        )
+        .await
+        .map_err(|_| IntegrityScanError::Maintenance)?;
         integrity::scan_archive(&self.state).await
     }
 
@@ -638,6 +671,12 @@ impl Service {
         &self,
         now: time::OffsetDateTime,
     ) -> Result<usize, MaintenanceError> {
+        let _maintenance_permit = maintenance::SharedPermit::acquire(
+            &self.state.database,
+            self.state.storage.maintenance_dir(),
+        )
+        .await
+        .map_err(|_| MaintenanceError::Operation)?;
         ingestion::expire_uploads_at(&self.state, now).await
     }
 }
@@ -659,6 +698,34 @@ pub async fn serve(config: Config) -> Result<(), BootstrapError> {
         .map_err(BootstrapError::Bind)?;
     tracing::info!("archive service listening");
     axum::serve(listener, service.router(&config))
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(BootstrapError::Serve)
+}
+
+/// Lets systemd's `SIGTERM` stop accepting new connections before its
+/// `TimeoutStopSec` safety net expires. Existing request futures retain the
+/// normal Axum graceful-shutdown window.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::warn!(%error, "SIGTERM graceful shutdown handler is unavailable");
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

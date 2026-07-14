@@ -1,0 +1,42 @@
+# Template installed by install.sh. It replaces __PATWARI_IMAGE__ with a
+# commit tag plus immutable digest; never copy this template directly.
+[Unit]
+Description=Patwari verified session archive
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=__PATWARI_IMAGE__
+Pull=never
+ContainerName=patwari
+EnvironmentFile=/etc/containers/systemd/patwari.env
+Volume=patwari-data.volume:/var/lib/patwari-volume:Z,U
+PublishPort=192.168.16.169:8787:8080/tcp
+User=10001:10001
+ReadOnly=true
+Tmpfs=/tmp:rw,noexec,nosuid,size=64m
+DropCapability=all
+NoNewPrivileges=true
+PidsLimit=256
+Memory=1g
+LogDriver=journald
+StopSignal=SIGTERM
+StopTimeout=45
+HealthCmd=/usr/bin/curl --fail --silent --show-error http://127.0.0.1:8080/readyz
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=20s
+HealthOnFailure=kill
+
+[Service]
+Restart=always
+RestartSec=5s
+TimeoutStopSec=45s
+MemoryMax=1G
+MemoryHigh=768M
+CPUQuota=200%
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

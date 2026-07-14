@@ -42,6 +42,8 @@ const HISTORY_LIMIT: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum IntegrityScanError {
+    #[error("integrity scan could not enter the archive maintenance gate")]
+    Maintenance,
     #[error("integrity scan could not generate a server timestamp")]
     Clock,
     #[error("integrity scan metadata operation failed")]

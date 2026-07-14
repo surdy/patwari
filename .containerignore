@@ -1,0 +1,10 @@
+.git
+target
+data
+*.db
+*.db-shm
+*.db-wal
+blobs
+uploads
+maintenance
+backups

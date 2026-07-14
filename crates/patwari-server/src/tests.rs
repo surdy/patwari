@@ -773,6 +773,10 @@ async fn bootstrap_from_empty_volume_creates_layout_and_identity_once() {
     assert!(data_dir.0.join("patwari.db").is_file());
     assert!(service.state.storage.blobs.is_dir());
     assert!(service.state.storage.uploads.is_dir());
+    drop(service);
+
+    let (_, restarted_identity) = Service::bootstrap(&config).await.expect("restarts");
+    assert_eq!(restarted_identity, identity);
 }
 
 #[tokio::test]
@@ -5701,4 +5705,424 @@ async fn integrity_scan_distinguishes_tombstones_and_blob_candidate_states() {
             .iter()
             .any(|finding| finding.kind == IntegrityFindingKind::BlobOrphan)
     );
+}
+
+#[tokio::test]
+async fn backup_restore_preserves_archive_identity_receipts_listing_and_downloads() {
+    let root = TestDataDir::new();
+    let config = Config {
+        data_dir: root.0.join("source"),
+        chunk_size_bytes: 1024,
+        max_artifact_stored_bytes: 64 * 1024 * 1024,
+        ..Config::default()
+    };
+    let (service, identity) = Service::bootstrap(&config)
+        .await
+        .expect("source bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let stored = b"durable backup artifact\n".repeat(200);
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "backup-round-trip",
+        manifest(&stored, &stored, Compression::Identity),
+        &stored,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let original_sessions: PaginatedResponse<SessionResponse> =
+        get_json(&service, &config, "/api/v1/sessions").await;
+
+    let backup_dir = root.0.join("backup");
+    let created = crate::backup::create(&config, &backup_dir)
+        .await
+        .expect("online backup succeeds while service is live");
+    assert_eq!(created.archive_instance_id, identity.archive_instance_id);
+    assert_eq!(created.blob_count, 1);
+    let verified = crate::backup::verify(&backup_dir, &config)
+        .await
+        .expect("backup verifies offline");
+    assert_eq!(verified.integrity.status, IntegrityRunStatus::Healthy);
+
+    let restored_dir = root.0.join("restored");
+    let restored = crate::backup::restore(&backup_dir, &restored_dir, &config)
+        .await
+        .expect("clean destination restores");
+    assert_eq!(restored.archive_instance_id, identity.archive_instance_id);
+    assert_eq!(restored.integrity.status, IntegrityRunStatus::Healthy);
+
+    let mut restored_config = config.clone();
+    restored_config.data_dir = restored_dir;
+    let (restored_service, restored_identity) = Service::bootstrap(&restored_config)
+        .await
+        .expect("restored archive bootstraps");
+    assert_eq!(restored_identity, identity);
+    let restored_sessions: PaginatedResponse<SessionResponse> =
+        get_json(&restored_service, &restored_config, "/api/v1/sessions").await;
+    assert_eq!(
+        serde_json::to_value(&restored_sessions).expect("sessions serialize"),
+        serde_json::to_value(&original_sessions).expect("sessions serialize")
+    );
+
+    let (retry_status, _, retry_body) = call(
+        restored_service.router(&restored_config),
+        Request::builder()
+            .method("POST")
+            .uri(&upload.completion_url)
+            .body(Body::empty())
+            .expect("completion retry request is valid"),
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::OK);
+    let restored_completion: CompletionResponse =
+        serde_json::from_slice(&retry_body).expect("restored receipt parses");
+    assert_eq!(
+        serde_json::to_value(&restored_completion.receipt).expect("receipt serializes"),
+        serde_json::to_value(&completion.receipt).expect("receipt serializes")
+    );
+
+    let snapshot: SnapshotResponse = get_json(
+        &restored_service,
+        &restored_config,
+        format!("/api/v1/snapshots/{}", completion.receipt.snapshot_id),
+    )
+    .await;
+    let (download_status, _, downloaded) = call(
+        restored_service.router(&restored_config),
+        Request::builder()
+            .uri(&snapshot.artifacts[0].content_url)
+            .body(Body::empty())
+            .expect("download request is valid"),
+    )
+    .await;
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(downloaded, stored);
+    assert_eq!(
+        restored_service
+            .verify_integrity()
+            .await
+            .expect("restored integrity scan completes")
+            .status,
+        IntegrityRunStatus::Healthy
+    );
+}
+
+#[tokio::test]
+async fn backup_refuses_active_uploads_and_restore_refuses_nonempty_destination() {
+    let root = TestDataDir::new();
+    let config = Config {
+        data_dir: root.0.join("source"),
+        chunk_size_bytes: 1024,
+        max_artifact_stored_bytes: 64 * 1024 * 1024,
+        ..Config::default()
+    };
+    let (service, _) = Service::bootstrap(&config)
+        .await
+        .expect("source bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let bytes = b"unfinished upload";
+    let active_upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "backup-active-upload",
+        manifest(bytes, bytes, Compression::Identity),
+    )
+    .await;
+    let backup_dir = root.0.join("backup");
+    assert!(matches!(
+        crate::backup::create(&config, &backup_dir).await,
+        Err(crate::backup::BackupError::ActiveUploads)
+    ));
+    assert!(!backup_dir.exists());
+
+    let (abandon_status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .method("POST")
+            .uri(&active_upload.abandon_url)
+            .body(Body::empty())
+            .expect("abandon request is valid"),
+    )
+    .await;
+    assert_eq!(abandon_status, StatusCode::OK);
+
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "backup-completed-upload",
+        manifest(bytes, bytes, Compression::Identity),
+        bytes,
+    )
+    .await;
+    complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    crate::backup::create(&config, &backup_dir)
+        .await
+        .expect("completed archive backs up");
+
+    let restore_dir = root.0.join("nonempty-restore");
+    stdfs::create_dir_all(&restore_dir).expect("create restore destination");
+    stdfs::write(restore_dir.join("keep"), b"must not be replaced")
+        .expect("write destination sentinel");
+    assert!(matches!(
+        crate::backup::restore(&backup_dir, &restore_dir, &config).await,
+        Err(crate::backup::BackupError::DestinationNotEmpty)
+    ));
+    assert!(restore_dir.join("keep").is_file());
+
+    stdfs::write(backup_dir.join("patwari.db"), b"corrupt backup database")
+        .expect("corrupt backup database");
+    assert!(matches!(
+        crate::backup::verify(&backup_dir, &config).await,
+        Err(crate::backup::BackupError::Manifest)
+    ));
+}
+
+#[tokio::test]
+async fn maintenance_lease_pauses_api_work_and_integrity_scans() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let permit = crate::maintenance::ExclusivePermit::acquire(
+        &service.state.database,
+        service.state.storage.maintenance_dir(),
+    )
+    .await
+    .expect("maintenance lease acquires");
+
+    let (status, _, body) = call(
+        service.router(&config),
+        Request::builder()
+            .uri("/api/v1/sessions")
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        String::from_utf8(body)
+            .expect("response is UTF-8")
+            .contains("maintenance_in_progress")
+    );
+    assert!(matches!(
+        service.verify_integrity().await,
+        Err(crate::IntegrityScanError::Maintenance)
+    ));
+
+    permit.release().await.expect("maintenance lease releases");
+    let (status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .uri("/api/v1/sessions")
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Reproduces the recommended deployment topology: a writable volume root
+/// (standing in for a Podman named volume mounted under a read-only
+/// container root) holding a `data` subdirectory as `PATWARI_DATA_DIR`.
+/// Restoring into that subdirectory stages its sibling directly beside it,
+/// inside the same writable volume root, and finalizes with a same-filesystem
+/// rename instead of ever writing outside the volume or across it.
+#[tokio::test]
+async fn restore_targets_writable_volume_subdirectory_with_sibling_staging() {
+    let root = TestDataDir::new();
+    let source_volume_root = root.0.join("source-volume-root");
+    let config = Config {
+        data_dir: source_volume_root.join("data"),
+        chunk_size_bytes: 1024,
+        max_artifact_stored_bytes: 64 * 1024 * 1024,
+        ..Config::default()
+    };
+    let (service, identity) = Service::bootstrap(&config)
+        .await
+        .expect("source bootstraps into its writable volume subdirectory");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let stored = b"volume topology restore fixture";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "volume-topology-restore",
+        manifest(stored, stored, Compression::Identity),
+        stored,
+    )
+    .await;
+    complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+
+    let backup_dir = root.0.join("backup");
+    crate::backup::create(&config, &backup_dir)
+        .await
+        .expect("online backup succeeds");
+
+    // The destination volume root exists and is writable (as a freshly
+    // mounted persistent volume would be), but its `data` subdirectory does
+    // not exist yet: the server's own bootstrap normally creates it, and
+    // restore must be able to create and populate it too.
+    let destination_volume_root = root.0.join("destination-volume-root");
+    stdfs::create_dir_all(&destination_volume_root)
+        .expect("create writable destination volume root");
+    let destination_data_dir = destination_volume_root.join("data");
+    assert!(!destination_data_dir.exists());
+
+    let restored = crate::backup::restore(&backup_dir, &destination_data_dir, &config)
+        .await
+        .expect("restore into a data subdirectory of a writable volume root succeeds");
+    assert_eq!(restored.archive_instance_id, identity.archive_instance_id);
+    assert_eq!(restored.integrity.status, IntegrityRunStatus::Healthy);
+    assert!(destination_data_dir.is_dir());
+
+    // The sibling staging directory used to build the restore is gone: the
+    // volume root contains only the finalized `data` directory.
+    let remaining_entries: Vec<_> = stdfs::read_dir(&destination_volume_root)
+        .expect("destination volume root is readable")
+        .map(|entry| entry.expect("directory entry is readable").file_name())
+        .collect();
+    assert_eq!(remaining_entries, vec![std::ffi::OsString::from("data")]);
+}
+
+/// Simulates a read-only container root by making the restore destination's
+/// parent directory unwritable. This is what `parent_or_current` resolves to
+/// when a persistent volume is mounted directly at `PATWARI_DATA_DIR` inside
+/// a `ReadOnly=true` container: restore must refuse with a clear error
+/// instead of surfacing a raw `EROFS` from a later sibling-staging attempt.
+#[cfg(unix)]
+#[tokio::test]
+async fn restore_refuses_destination_with_unwritable_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDataDir::new();
+    let config = Config {
+        data_dir: root.0.join("source"),
+        chunk_size_bytes: 1024,
+        max_artifact_stored_bytes: 64 * 1024 * 1024,
+        ..Config::default()
+    };
+    let (service, _) = Service::bootstrap(&config)
+        .await
+        .expect("source bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let stored = b"read-only rootfs restore fixture";
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "read-only-rootfs-restore",
+        manifest(stored, stored, Compression::Identity),
+        stored,
+    )
+    .await;
+    complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let backup_dir = root.0.join("backup");
+    crate::backup::create(&config, &backup_dir)
+        .await
+        .expect("online backup succeeds");
+
+    let read_only_parent = root.0.join("read-only-rootfs");
+    stdfs::create_dir_all(&read_only_parent).expect("create parent to lock down");
+    stdfs::set_permissions(&read_only_parent, stdfs::Permissions::from_mode(0o555))
+        .expect("make parent directory read-only");
+    let destination = read_only_parent.join("data");
+
+    let result = crate::backup::restore(&backup_dir, &destination, &config).await;
+
+    // Restore the writable bit before any assertion can panic and before the
+    // temporary directory is cleaned up on drop.
+    stdfs::set_permissions(&read_only_parent, stdfs::Permissions::from_mode(0o755))
+        .expect("restore parent directory permissions for cleanup");
+
+    assert!(matches!(
+        result,
+        Err(crate::backup::BackupError::UnsafeDestination)
+    ));
+    assert!(!destination.exists());
+}
+
+/// Proves, without waiting out any real refresh interval, that an exclusive
+/// maintenance permit never rewrites `maintenance_gate` after the single
+/// claim made by `acquire`. Forcing the row's expiry into the past
+/// reproduces exactly the state a periodic heartbeat would have "fixed" by
+/// refreshing it; leaving that forced value untouched shows no such
+/// heartbeat exists. It also proves the second half of the invariant this
+/// design depends on: a lease that looks expired still cannot admit a
+/// mutator, because every mutator's shared-lock acquisition keeps failing
+/// against the still-held exclusive flock regardless of what the lease row
+/// says.
+#[tokio::test]
+async fn exclusive_maintenance_permit_never_rewrites_its_lease_while_held() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let permit = crate::maintenance::ExclusivePermit::acquire(
+        &service.state.database,
+        service.state.storage.maintenance_dir(),
+    )
+    .await
+    .expect("maintenance lease acquires");
+
+    let claimed: (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT exclusive_token, exclusive_until_unix FROM maintenance_gate WHERE singleton = 1",
+    )
+    .fetch_one(&service.state.database)
+    .await
+    .expect("maintenance_gate is queryable");
+    let (token, _) = claimed;
+    let token = token.expect("exclusive permit claims a token");
+
+    // Simulate the lease having already run past a would-be refresh interval
+    // (and indeed past its own expiry) without any real sleep.
+    let forced_past_expiry = 1;
+    sqlx::query(
+        "UPDATE maintenance_gate SET exclusive_until_unix = ?1
+         WHERE singleton = 1 AND exclusive_token = ?2",
+    )
+    .bind(forced_past_expiry)
+    .bind(&token)
+    .execute(&service.state.database)
+    .await
+    .expect("test can force the lease into the past");
+
+    // A mutator must still be refused: the flock, not the lease clock, is
+    // what is actually held. The gate covers every request, so a plain GET
+    // is enough to prove it without constructing a write payload.
+    let (status, _, _) = call(
+        service.router(&config),
+        Request::builder()
+            .uri("/api/v1/sessions")
+            .body(Body::empty())
+            .expect("request is valid"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let after_wait: (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT exclusive_token, exclusive_until_unix FROM maintenance_gate WHERE singleton = 1",
+    )
+    .fetch_one(&service.state.database)
+    .await
+    .expect("maintenance_gate is queryable");
+    assert_eq!(
+        after_wait,
+        (Some(token), Some(forced_past_expiry)),
+        "no background task refreshed the lease while the exclusive permit was held"
+    );
+
+    permit.release().await.expect("maintenance lease releases");
+    let cleared: (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT exclusive_token, exclusive_until_unix FROM maintenance_gate WHERE singleton = 1",
+    )
+    .fetch_one(&service.state.database)
+    .await
+    .expect("maintenance_gate is queryable");
+    assert_eq!(cleared, (None, None));
 }

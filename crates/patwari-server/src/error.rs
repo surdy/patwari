@@ -78,6 +78,22 @@ impl ApiError {
             "archive metadata could not be used",
         )
     }
+
+    pub(crate) const fn maintenance() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "maintenance_in_progress",
+            "archive operations are temporarily paused for maintenance",
+        )
+    }
+
+    pub(crate) const fn maintenance_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "maintenance_unavailable",
+            "archive maintenance coordination is unavailable",
+        )
+    }
 }
 
 impl IntoResponse for ApiError {

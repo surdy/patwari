@@ -1,0 +1,5 @@
+[Volume]
+# Quadlet generates the rootful local Podman volume
+# `systemd-patwari-data`, stored under /var/lib/containers/storage/volumes/.
+Driver=local
+Label=io.patwari.purpose=archive-data

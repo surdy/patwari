@@ -7,12 +7,14 @@
 pub mod config;
 pub mod contract;
 
+pub mod backup;
 mod database;
 mod deletion;
 mod error;
 mod health;
 mod ingestion;
 mod integrity;
+mod maintenance;
 mod pagination;
 mod retrieval;
 mod service;
