@@ -4,14 +4,17 @@ Patwari is a self-hosted archive for complete coding-agent sessions.
 
 **Munshi writes the record; Patwari keeps the archive.**
 
-Munshi captures session files on developer machines, compresses them, and uploads immutable
-snapshots to Patwari. Notesmith remains the home for human-readable summaries. A Notesmith summary
-may reference its Patwari session ID when full context is needed.
+Munshi captures session files on developer machines, compresses them, and submits an immutable
+proposed manifest plus stored artifact bytes to Patwari. Notesmith remains the home for
+human-readable summaries. A Notesmith summary may reference its Patwari session ID when full context
+is needed.
 
-## Running the archive foundation
+## Running the archive
 
-The current service establishes a durable archive identity and proves its local dependencies are
-usable. It deliberately does not yet expose ingestion APIs.
+The service establishes a durable archive identity and provides the initial single-artifact archival
+path. A Munshi installation registers its client UUID, creates an upload with one canonical manifest,
+streams the declared stored bytes, completes verification, and then fetches the immutable snapshot or
+stored artifact.
 
 ```sh
 cargo run -p patwari-server
@@ -80,7 +83,7 @@ recorded in [`docs/adr/`](docs/adr/).
 
 - Accept immutable, versioned snapshots of logical coding-agent sessions.
 - Preserve every declared artifact with size and checksum verification.
-- Make retries idempotent and interrupted uploads resumable.
+- Make upload creation and completion retries idempotent.
 - Expose stable metadata and artifact APIs for Munshi and future analysis tools.
 - Keep agent-specific interpretation in Munshi source adapters.
 - Return a durable archival receipt only after a complete snapshot has been verified.
@@ -122,8 +125,8 @@ extraction system itself.
 
 - Owns remote session and snapshot identity.
 - Validates manifests and upload state.
-- Streams chunks to temporary storage with bounded resource use.
-- Verifies final sizes and checksums.
+- Streams the one declared artifact to temporary storage with bounded resource use.
+- Verifies stored and decompressed original sizes and checksums.
 - Atomically promotes verified blobs into immutable storage.
 - Indexes normalized metadata without interpreting transcript contents.
 - Lists and returns manifests, snapshots, and artifacts.
@@ -156,13 +159,12 @@ Identifies the Munshi installation that uploaded data. This is operational ident
 authentication principal.
 
 ```text
-id
-name
-hostname
-munshi_version
-first_seen_at
-last_seen_at
-metadata
+id (client-generated UUID)
+hostname (mutable)
+display_name (mutable)
+metadata (mutable)
+created_at
+updated_at
 ```
 
 ### Session
@@ -181,15 +183,12 @@ Repository, branch, machine, and timestamps are attributes rather than identity 
 id
 source_agent
 source_session_id
-project
-repository
-branch
-started_at
-last_activity_at
 created_at
 updated_at
-source_metadata
 ```
+
+Capture context such as project, repository, branch, source cursor, and source-version facts belongs
+to the canonical manifest rather than mutable session identity.
 
 ### Snapshot
 
@@ -198,31 +197,13 @@ An immutable, internally consistent capture of a session at a source cursor or s
 ```text
 id
 session_id
-client_id
-source_cursor
-source_state_hash
-source_agent_version
-munshi_version
-captured_at
-manifest_version
+snapshot_fingerprint
 manifest_hash
-compression
-total_stored_bytes
-status
-created_at
 completed_at
 ```
 
-Snapshot states:
-
-```text
-pending -> uploading -> verifying -> complete
-                                \-> failed
-pending/uploading -> abandoned
-```
-
-Only `complete` snapshots are archived snapshots. Snapshot records and manifests are immutable after
-completion.
+Only completed snapshots exist. Uploads are separate mutable transfer attempts, while snapshots,
+their canonical manifests, and their artifacts are immutable after verification.
 
 ### Artifact
 
@@ -234,17 +215,18 @@ snapshot_id
 logical_path
 media_type
 original_size_bytes
-stored_size_bytes
-stored_sha256
-compression
-storage_key
-status
-created_at
-completed_at
+original_sha256
+blob_id
 ```
 
 Logical paths are relative, normalized, and unique within a snapshot. Absolute source paths must
 not be used as artifact identity.
+
+### Blob
+
+A blob is the stored representation of an artifact. It records the stored SHA-256, stored size, and
+compression. Blob bytes are content-addressed on disk; the artifact retains the original-content
+SHA-256 and size.
 
 ### Archival receipt
 
@@ -253,57 +235,51 @@ The completion response is evidence that Patwari received and verified the decla
 ```text
 snapshot_id
 manifest_hash
-artifact_count
+snapshot_fingerprint
+archive_instance_id
+artifact_count (currently one)
+total_original_bytes
 total_stored_bytes
 completed_at
-server_version
+receipt_version
 ```
 
 This receipt confirms Patwari integrity only. Filesystem replication and backup remain external
 operational responsibilities.
 
-## Manifest v1
+## Single-artifact manifest v1
 
 ```json
 {
   "schema_version": 1,
   "session": {
     "source_agent": "copilot-cli",
-    "source_session_id": "abc123",
-    "project": "munshi",
-    "repository": "surdy/munshi",
-    "branch": "main"
+    "source_session_id": "abc123"
   },
-  "snapshot": {
+  "capture": {
     "captured_at": "2026-07-11T19:42:00Z",
     "source_cursor": "184",
-    "source_state_hash": "sha256:...",
+    "project": "munshi",
+    "repository": "surdy/munshi",
+    "branch": "main",
     "source_agent_version": "1.0.70",
     "munshi_version": "0.1.0"
   },
-  "artifacts": [
-    {
-      "logical_path": "events.jsonl.zst",
-      "media_type": "application/x-ndjson",
-      "original_size_bytes": 504321,
-      "stored_size_bytes": 91234,
-      "stored_sha256": "sha256:...",
-      "compression": "zstd"
-    },
-    {
-      "logical_path": "session.db.zst",
-      "media_type": "application/vnd.sqlite3",
-      "original_size_bytes": 1048576,
-      "stored_size_bytes": 183210,
-      "stored_sha256": "sha256:...",
-      "compression": "zstd"
-    }
-  ]
+  "artifact": {
+    "logical_path": "events.jsonl",
+    "media_type": "application/x-ndjson",
+    "original_size_bytes": 504321,
+    "original_sha256": "sha256:...",
+    "stored_size_bytes": 91234,
+    "stored_sha256": "sha256:...",
+    "compression": "zstd"
+  }
 }
 ```
 
-The manifest describes individually downloadable files. Patwari treats their contents as opaque even
-though they are server-readable.
+Hashes are exactly `sha256:` followed by 64 lowercase hexadecimal digits. The server normalizes and
+serializes this document before persisting it; this canonical form is authoritative. Version 1
+accepts exactly one normalized relative regular-file logical path.
 
 ## API v1
 
@@ -315,19 +291,10 @@ GET    /healthz
 
 PUT    /api/v1/clients/{client_id}
 
-PUT    /api/v1/sessions/{source_agent}/{source_session_id}
-GET    /api/v1/sessions
-GET    /api/v1/sessions/{session_id}
-
-POST   /api/v1/sessions/{session_id}/snapshots
-GET    /api/v1/sessions/{session_id}/snapshots
+POST   /api/v1/uploads
+PUT    /api/v1/uploads/{upload_id}/artifacts/0/chunks/0
+POST   /api/v1/uploads/{upload_id}/complete
 GET    /api/v1/snapshots/{snapshot_id}
-POST   /api/v1/snapshots/{snapshot_id}/complete
-DELETE /api/v1/snapshots/{snapshot_id}
-
-GET    /api/v1/snapshots/{snapshot_id}/artifacts
-GET    /api/v1/artifacts/{artifact_id}
-PUT    /api/v1/artifacts/{artifact_id}/chunks/{chunk_index}
 GET    /api/v1/artifacts/{artifact_id}/content
 ```
 
@@ -336,27 +303,15 @@ disabled by default until retention semantics and CLI confirmation are implement
 
 ### Idempotency
 
-- Session upsert is keyed by `source_agent + source_session_id`.
-- Snapshot creation uses an idempotency key derived from session ID and manifest hash.
-- Repeating a request with identical content returns the existing resource.
-- Reusing a key with different content returns `409 Conflict`.
-- Artifact chunks are addressed by index and checksum, making retries safe.
-- Snapshot completion may be retried and returns the same receipt.
-
-### Resumable uploads
-
-1. Munshi submits the complete manifest.
-2. Patwari returns the snapshot, artifact IDs, chunk size, and existing chunk bitmap.
-3. Munshi uploads missing fixed-size chunks.
-4. Each chunk request includes its byte length and checksum.
-5. Patwari writes chunks into snapshot-scoped temporary storage.
-6. Munshi requests snapshot completion.
-7. Patwari assembles and verifies every artifact against the manifest.
-8. Verified content is atomically moved into the blob store.
-9. Patwari commits the snapshot as `complete` and returns the archival receipt.
-
-Incomplete uploads are never listed as archived snapshots. A garbage-collection job removes
-abandoned temporary uploads after a configurable period.
+- Client registration is an idempotent `PUT` keyed by its client-generated UUID. Hostname, display
+  name, and metadata are mutable attributes.
+- Upload creation requires a client idempotency key. Repeating it with the same canonical manifest
+  returns the existing upload; reusing it for a different manifest returns `409 Conflict`.
+- Session creation is atomic with upload creation and is keyed within the owner namespace by
+  `source_agent + source_session_id`.
+- The sole artifact is addressed as chunk index `0`; multi-chunk resume is deliberately deferred.
+- Retrying completion returns byte-for-byte the same versioned receipt, including the persistent
+  archive instance ID.
 
 ## Storage design
 
