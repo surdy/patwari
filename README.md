@@ -417,6 +417,10 @@ the focused capture-provenance relation URL.
 
 ## Multi-artifact manifest v1
 
+`source_agent` is free-form archival metadata (a non-empty string, at most 128 bytes, no control
+characters), not an enum: Patwari never branches on it. Munshi currently submits `"copilot-cli"`
+and `"claude-code"` sessions; new agents need no Patwari change.
+
 ```json
 {
   "schema_version": 1,

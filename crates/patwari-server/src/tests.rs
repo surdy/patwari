@@ -6126,3 +6126,60 @@ async fn exclusive_maintenance_permit_never_rewrites_its_lease_while_held() {
     .expect("maintenance_gate is queryable");
     assert_eq!(cleared, (None, None));
 }
+
+/// Regression guard for non-Copilot sources: `source_agent` is free-form archival metadata, so a
+/// Claude Code session (a `<uuid>.jsonl` transcript artifact) ingests, completes, and filters
+/// without any agent-specific server behavior.
+#[tokio::test]
+async fn claude_code_sessions_ingest_and_filter_like_any_source_agent() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let original = b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+    let mut document = manifest(original, original, Compression::Identity);
+    document["session"]["source_agent"] = serde_json::json!("claude-code");
+    document["session"]["source_session_id"] =
+        serde_json::json!("0c1a0de0-0000-4000-8000-000000000001");
+    document["artifact"]["logical_path"] =
+        serde_json::json!("0c1a0de0-0000-4000-8000-000000000001.jsonl");
+    document["capture"]["source_agent_version"] = serde_json::json!("2.1.205");
+
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "claude-capture-1",
+        document,
+        original,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    assert!(!completion.receipt.snapshot_id.is_empty());
+    assert_eq!(snapshot_count(&service).await, 1);
+
+    let claude_sessions: PaginatedResponse<SessionResponse> = get_json(
+        &service,
+        &config,
+        "/api/v1/sessions?source_agent=claude-code",
+    )
+    .await;
+    assert_eq!(claude_sessions.items.len(), 1);
+    let session = &claude_sessions.items[0];
+    assert_eq!(session.source_agent, "claude-code");
+    assert_eq!(
+        session.source_session_id,
+        "0c1a0de0-0000-4000-8000-000000000001"
+    );
+
+    let copilot_sessions: PaginatedResponse<SessionResponse> = get_json(
+        &service,
+        &config,
+        "/api/v1/sessions?source_agent=copilot-cli",
+    )
+    .await;
+    assert!(copilot_sessions.items.is_empty());
+}
