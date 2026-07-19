@@ -27,7 +27,7 @@ The full Munshi plan is in [`README.md`](../README.md). Important decisions alre
 | --- | --- |
 | Munshi implementation | Rust |
 | Initial session source | GitHub Copilot CLI |
-| Later sources | Claude Code and OpenAI Codex CLI |
+| Later sources | Claude Code (now a live Munshi source) and OpenAI Codex CLI |
 | Summary engine | Copilot CLI in noninteractive mode |
 | Summary output | Markdown with YAML front matter |
 | Session behavior | One report per logical session |
