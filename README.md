@@ -1,4 +1,6 @@
-# Patwari
+<p align="center">
+  <img src="brand/header.svg" alt="patwari — where session records live forever" width="720">
+</p>
 
 Patwari is a self-hosted archive for complete coding-agent sessions.
 
