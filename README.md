@@ -512,6 +512,8 @@ GET    /api/v1/manifests
 GET    /api/v1/manifests/{manifest_id}
 
 GET    /api/v1/artifacts
+GET    /api/v1/artifacts?original_sha256={hex}
+GET    /api/v1/artifacts?stored_sha256={hex}
 GET    /api/v1/artifacts/{artifact_id}
 GET    /api/v1/artifacts/{artifact_id}/content
 
@@ -520,6 +522,13 @@ GET    /api/v1/admin/tombstones
 GET    /api/v1/admin/tombstones/{snapshot_id}
 POST   /api/v1/admin/blob-gc
 ```
+
+`GET /api/v1/artifacts` also accepts `original_sha256` and `stored_sha256` equality filters (bare
+64-character lowercase hex), composable with the `snapshot_id` and `session_id` filters. This is
+the hash-addressed lookup from ADR 0004: a client holding only a content hash — for example a
+Munshi claim ticket — resolves the artifacts carrying it without walking sessions and snapshots.
+Because blobs are deduplicated per owner, one hash may resolve to multiple artifacts across
+snapshots; the listing returns all of them through normal pagination.
 
 `POST /uploads` requires `capture_id` and reports it with the assigned `chunk_size_bytes`.
 `idempotency_key` remains a deprecated compatibility alias when `capture_id` is omitted; when both
