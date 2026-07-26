@@ -58,6 +58,12 @@ One regular byte stream at a unique normalized logical path within a snapshot. A
 original content and refers to a stored blob.
 _Avoid_: Blob, file object, chunk
 
+**Artifact role**:
+What an artifact means within its snapshot — transcript, summary, extracted tool output — conveyed by
+its logical path under the manifest's artifact-set version. Roles are a client convention; Patwari
+records the paths but never branches on them.
+_Avoid_: Content kind, media type, artifact type
+
 **Blob**:
 A verified stored representation of artifact content, deduplicated within an owner by its stored bytes.
 Different snapshots and artifacts may refer to the same blob.

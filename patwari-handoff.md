@@ -418,6 +418,11 @@ Suggested direction:
 - Never invent a custom encryption construction; use an established envelope format and audited
   libraries.
 
+> **Decided (July 2026):** v1 stores unencrypted blobs and keeps end-to-end original-content
+> verification; client-side encryption is deferred until Patwari crosses the trusted network
+> boundary, together with authentication. See
+> [ADR 0006](docs/adr/0006-plaintext-verifiable-blobs.md).
+
 ## Storage architecture
 
 Separate metadata from blobs.
