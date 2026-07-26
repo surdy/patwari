@@ -333,12 +333,16 @@ pub(crate) fn validate_digest(value: &str) -> Result<(), ApiError> {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return Err(ApiError::invalid("hash must be a lowercase sha256 digest"));
     };
-    if hex.len() != 64
-        || !hex.bytes().all(|byte| {
+    validate_content_hash(hex, "hash must be a lowercase sha256 digest")
+}
+
+pub(crate) fn validate_content_hash(value: &str, message: &'static str) -> Result<(), ApiError> {
+    if value.len() != 64
+        || !value.bytes().all(|byte| {
             byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
         })
     {
-        return Err(ApiError::invalid("hash must be a lowercase sha256 digest"));
+        return Err(ApiError::invalid(message));
     }
     Ok(())
 }

@@ -50,7 +50,7 @@ use crate::{
         page_from_rows, parse_page,
     },
     service::AppState,
-    validation::{parse_uuid, validate_capture_identifier},
+    validation::{parse_uuid, validate_capture_identifier, validate_content_hash},
 };
 
 const MAX_CONTEXT_FILTER_BYTES: usize = 512;
@@ -132,6 +132,15 @@ fn normalize_resource_id(
 ) -> Result<Option<String>, ApiError> {
     value
         .map(|value| parse_uuid(value, message).map(|id| id.to_string()))
+        .transpose()
+}
+
+fn normalize_content_hash(
+    value: Option<&str>,
+    message: &'static str,
+) -> Result<Option<String>, ApiError> {
+    value
+        .map(|value| validate_content_hash(value, message).map(|()| value.to_owned()))
         .transpose()
 }
 
@@ -1410,12 +1419,20 @@ pub(crate) struct ArtifactListQuery {
     cursor: Option<String>,
     snapshot_id: Option<String>,
     session_id: Option<String>,
+    original_sha256: Option<String>,
+    stored_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct ArtifactFilters {
     snapshot_id: Option<String>,
     session_id: Option<String>,
+    // Skipped when absent so cursors minted before these filters existed keep
+    // hashing to the same filter set and stay valid across the upgrade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored_sha256: Option<String>,
 }
 
 pub(crate) async fn list_artifacts(
@@ -1431,6 +1448,14 @@ pub(crate) async fn list_artifacts(
         session_id: normalize_resource_id(
             query.session_id.as_deref(),
             "session identifier is not a UUID",
+        )?,
+        original_sha256: normalize_content_hash(
+            query.original_sha256.as_deref(),
+            "original content hash is not a lowercase sha256 hex digest",
+        )?,
+        stored_sha256: normalize_content_hash(
+            query.stored_sha256.as_deref(),
+            "stored content hash is not a lowercase sha256 hex digest",
         )?,
     };
     let filter_hash = filter_hash(ARTIFACT_CURSOR_KIND, &filters)?;
@@ -1455,6 +1480,12 @@ pub(crate) async fn list_artifacts(
     if filters.session_id.is_some() {
         sql.push_str(" AND s.session_id = ?");
     }
+    if filters.original_sha256.is_some() {
+        sql.push_str(" AND a.original_sha256 = ?");
+    }
+    if filters.stored_sha256.is_some() {
+        sql.push_str(" AND b.stored_sha256 = ?");
+    }
     append_descending_bounds(&mut sql, "a.created_at_seq", "a.id", &page);
     sql.push_str(" ORDER BY a.created_at_seq DESC, a.id DESC LIMIT ?");
     let mut request = sqlx::query_as::<_, ArtifactMetadataRow>(&sql);
@@ -1462,6 +1493,12 @@ pub(crate) async fn list_artifacts(
         request = request.bind(value);
     }
     if let Some(value) = &filters.session_id {
+        request = request.bind(value);
+    }
+    if let Some(value) = &filters.original_sha256 {
+        request = request.bind(value);
+    }
+    if let Some(value) = &filters.stored_sha256 {
         request = request.bind(value);
     }
     request = bind_descending_bounds(request, &page);

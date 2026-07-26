@@ -3388,6 +3388,262 @@ async fn archive_browsing_projects_latest_context_without_rewriting_history() {
     assert_eq!(artifact, artifacts.items[0]);
 }
 
+async fn upload_multi_artifact_chunks(
+    service: &Service,
+    config: &Config,
+    upload: &UploadResponse,
+    stored_by_path: &[(&str, &[u8])],
+) {
+    for descriptor in &upload.artifacts {
+        let stored = stored_by_path
+            .iter()
+            .find(|(path, _)| *path == descriptor.logical_path)
+            .map(|(_, bytes)| *bytes)
+            .expect("every declared artifact has stored bytes");
+        for (index, chunk) in stored.chunks(config.chunk_size_bytes).enumerate() {
+            assert_eq!(
+                upload_artifact_chunk(
+                    service,
+                    config,
+                    &upload.upload_id,
+                    descriptor.artifact_index,
+                    index as u64,
+                    chunk,
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn artifacts_resolve_by_original_hash_and_downloads_verify_both_representations() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let identity = b"identity artifact events\n".repeat(40);
+    let plain = (0_u32..2_700)
+        .map(|value| {
+            let mixed = value.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            mixed.to_le_bytes()[2]
+        })
+        .collect::<Vec<_>>();
+    let compressed = zstd::stream::encode_all(&plain[..], 1).expect("compresses");
+    assert!(
+        compressed.len() > config.chunk_size_bytes,
+        "zstd fixture spans more than one chunk"
+    );
+
+    let upload = create_upload(
+        &service,
+        &config,
+        client_id,
+        "hash-lookup",
+        multi_manifest(
+            vec![
+                ("index.bin", &identity, &identity, Compression::Identity),
+                ("events.bin", &plain, &compressed, Compression::Zstd),
+            ],
+            "hash-lookup",
+        ),
+    )
+    .await;
+    upload_multi_artifact_chunks(
+        &service,
+        &config,
+        &upload,
+        &[("index.bin", &identity), ("events.bin", &compressed)],
+    )
+    .await;
+    complete_upload_for_receipt(&service, &config, &upload.completion_url).await;
+
+    for (original, stored, compression) in [
+        (
+            identity.as_slice(),
+            identity.as_slice(),
+            Compression::Identity,
+        ),
+        (plain.as_slice(), compressed.as_slice(), Compression::Zstd),
+    ] {
+        let listed: PaginatedResponse<ArtifactMetadataResponse> = get_json(
+            &service,
+            &config,
+            format!(
+                "/api/v1/artifacts?original_sha256={}",
+                digest_storage_hex(original)
+            ),
+        )
+        .await;
+        assert_eq!(
+            listed.items.len(),
+            1,
+            "each original hash resolves to its single artifact"
+        );
+        let artifact = &listed.items[0];
+        assert_eq!(artifact.original_sha256, digest(original));
+        assert_eq!(artifact.stored_sha256, digest(stored));
+        assert_eq!(artifact.compression, compression);
+
+        let (status, downloaded) = fetch_content(&service, &config, &artifact.content_url).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            downloaded, stored,
+            "content download returns the stored bytes verbatim"
+        );
+        assert_eq!(
+            digest(&downloaded),
+            artifact.stored_sha256,
+            "downloaded bytes match the advertised stored digest"
+        );
+        let decoded = match compression {
+            Compression::Identity => downloaded.clone(),
+            Compression::Zstd => {
+                zstd::stream::decode_all(&downloaded[..]).expect("stored zstd bytes decode")
+            }
+        };
+        assert_eq!(
+            digest(&decoded),
+            artifact.original_sha256,
+            "locally decoded bytes match the advertised original digest"
+        );
+        assert_eq!(decoded, original);
+    }
+}
+
+#[tokio::test]
+async fn hash_filter_returns_every_snapshot_carrying_the_same_content() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let shared = b"content deduplicated across two sessions\n".repeat(20);
+
+    let mut snapshot_ids = Vec::new();
+    for session in ["dedup-session-a", "dedup-session-b"] {
+        let upload = upload_full(
+            &service,
+            &config,
+            client_id,
+            session,
+            manifest_with_session(&shared, &shared, Compression::Identity, session),
+            &shared,
+        )
+        .await;
+        let receipt = complete_upload_for_receipt(&service, &config, &upload.completion_url).await;
+        snapshot_ids.push(receipt.snapshot_id);
+    }
+    assert_ne!(
+        snapshot_ids[0], snapshot_ids[1],
+        "distinct sessions produce distinct snapshots sharing one blob"
+    );
+    let expected: std::collections::HashSet<&str> =
+        snapshot_ids.iter().map(String::as_str).collect();
+
+    for field in ["original_sha256", "stored_sha256"] {
+        let listed: PaginatedResponse<ArtifactMetadataResponse> = get_json(
+            &service,
+            &config,
+            format!("/api/v1/artifacts?{field}={}", digest_storage_hex(&shared)),
+        )
+        .await;
+        assert_eq!(
+            listed.items.len(),
+            2,
+            "one {field} hash resolves to both deduplicated artifacts"
+        );
+        let resolved: std::collections::HashSet<&str> = listed
+            .items
+            .iter()
+            .map(|artifact| artifact.snapshot_id.as_str())
+            .collect();
+        assert_eq!(resolved, expected);
+    }
+}
+
+#[tokio::test]
+async fn malformed_hash_filters_are_rejected_as_validation_errors() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+
+    let valid = digest_storage_hex(b"any content");
+    let malformed = [
+        valid[..63].to_string(),
+        valid.to_ascii_uppercase(),
+        "g".repeat(64),
+    ];
+    for field in ["original_sha256", "stored_sha256"] {
+        for value in &malformed {
+            let (status, _, _) = call(
+                service.router(&config),
+                Request::builder()
+                    .uri(format!("/api/v1/artifacts?{field}={value}"))
+                    .body(Body::empty())
+                    .expect("request is valid"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{field}={value} must be rejected"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn hash_filter_composes_with_session_id_to_narrow_results() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+    let shared = b"content shared by two sessions for composition\n".repeat(20);
+
+    let mut by_session = Vec::new();
+    for session in ["compose-session-a", "compose-session-b"] {
+        let upload = upload_full(
+            &service,
+            &config,
+            client_id,
+            session,
+            manifest_with_session(&shared, &shared, Compression::Identity, session),
+            &shared,
+        )
+        .await;
+        let receipt = complete_upload_for_receipt(&service, &config, &upload.completion_url).await;
+        by_session.push((receipt.session_id, receipt.snapshot_id));
+    }
+
+    let hash = digest_storage_hex(&shared);
+    let unfiltered: PaginatedResponse<ArtifactMetadataResponse> = get_json(
+        &service,
+        &config,
+        format!("/api/v1/artifacts?original_sha256={hash}"),
+    )
+    .await;
+    assert_eq!(unfiltered.items.len(), 2);
+
+    let (target_session, target_snapshot) = &by_session[0];
+    let narrowed: PaginatedResponse<ArtifactMetadataResponse> = get_json(
+        &service,
+        &config,
+        format!("/api/v1/artifacts?original_sha256={hash}&session_id={target_session}"),
+    )
+    .await;
+    assert_eq!(
+        narrowed.items.len(),
+        1,
+        "the session filter narrows the hash matches to one snapshot"
+    );
+    assert_eq!(narrowed.items[0].snapshot_id, *target_snapshot);
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn archive_browsing_keyset_pages_are_stable_across_newer_records_and_ties() {
