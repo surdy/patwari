@@ -29,6 +29,15 @@ HealthRetries=3
 HealthStartPeriod=20s
 HealthOnFailure=kill
 
+# ── Caddy reverse proxy labels ──────────────────────────────────────────────
+# Publishes patwari.clusterfault.com via caddy-docker-proxy, matching the other
+# quadhost services. DNS for the name is managed by dnscontrol in the quadhost
+# repo and resolves only to LAN and Tailscale-CGNAT addresses. Patwari v1 is
+# unauthenticated: this name must never resolve to a publicly routable address.
+Label=caddy=patwari.clusterfault.com
+Label=caddy.reverse_proxy=192.168.16.169:8787
+Label="caddy.tls.dns=cloudflare {$$CLOUDFLARE_API_TOKEN}"
+
 [Service]
 Restart=always
 RestartSec=5s

@@ -16,10 +16,16 @@ Munshi on trusted LAN -> 192.168.16.169:8787 -> container 0.0.0.0:8080
 The server must bind `0.0.0.0:8080` inside its network namespace so Podman can
 publish it, but never publish it on `0.0.0.0` at the host. Do not add an
 internet-facing reverse proxy, port-forward, or firewall exception. Maintain a
-host firewall rule permitting only the trusted LAN. Tailscale
-(`100.81.17.63`) is not published by default; if it is intentionally used,
-add a separate specifically bound publish after reviewing the same trust
-boundary.
+host firewall rule permitting only the trusted LAN.
+
+The quadlet additionally carries caddy-docker-proxy labels publishing
+`patwari.clusterfault.com` through the host's Caddy on 443. This is the
+reviewed Tailscale/LAN publish: DNS for the name is managed declaratively by
+dnscontrol in the quadhost repository and resolves only to the LAN address
+(UniFi, for home clients) and the Tailscale CGNAT address `100.81.17.63`
+(Cloudflare, unroutable off the tailnet). Because Patwari v1 is
+unauthenticated, every device on the tailnet is inside the trust boundary, and
+the name must never resolve to a publicly routable address.
 
 ## Build and install
 
