@@ -91,7 +91,7 @@ Configuration is environment-based and bounded by default:
 | `PATWARI_MAX_SNAPSHOT_ORIGINAL_BYTES` | `17179869184` | Maximum original-byte sum in one snapshot |
 | `PATWARI_UPLOAD_EXPIRY` | `24h` | Server-time lifetime of an unfinished upload |
 | `PATWARI_ADMIN_DELETION_ENABLED` | `false` | Enables trusted-boundary administrative deletion and GC HTTP endpoints |
-| `PATWARI_BLOB_GC_GRACE` | `7d` | Server-time delay before an unreferenced blob is GC eligible |
+| `PATWARI_BLOB_GC_GRACE` | `90d` | Server-time delay before an unreferenced blob is GC eligible |
 | `PATWARI_INTEGRITY_SCAN_CONCURRENCY` | `4` | Maximum concurrent checksum/decompression workers used by `verify` |
 | `PATWARI_INTEGRITY_SCAN_BUFFER_BYTES` | `65536` | Per-worker scan read/decompression buffer |
 
@@ -106,7 +106,7 @@ service verifies both stored and decompressed sizes while streaming; it never tr
 checksum or size alone. Integrity scan concurrency is 1–32 workers and its buffer is 4 KiB–1 MiB.
 
 Administrative deletion is opt-in: `PATWARI_ADMIN_DELETION_ENABLED` accepts only `true` or `false`
-and defaults to `false`. Blob-GC grace is 1m–365d; it defaults to 7d. Operators must enable the
+and defaults to `false`. Blob-GC grace is 1m–365d; it defaults to 90d — deletion is the suite's only irreversible act, so the default gives a mistaken tombstone a whole season to be noticed before its bytes can go. Operators must enable the
 administrative surface only behind the same trusted network boundary required by the unauthenticated
 v1 service.
 

@@ -17,8 +17,12 @@ pub const DEFAULT_MAX_SNAPSHOT_ORIGINAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_EXPIRY: Duration = Duration::from_hours(24);
 pub const DEFAULT_ADMIN_DELETION_ENABLED: bool = false;
 /// A deleted snapshot remains recoverable from host backups while its
-/// unreferenced blobs wait for a conservative server-time grace period.
-pub const DEFAULT_BLOB_GC_GRACE: Duration = Duration::from_hours(7 * 24);
+/// unreferenced blobs wait for a conservative server-time grace period. 90 days by
+/// default: the archive's operator model treats blob storage as cheap and deletion as
+/// the suite's only irreversible act, so a mistaken tombstone should survive a whole
+/// season of not being noticed — an operator who wants faster reclamation opts into it
+/// explicitly with `PATWARI_BLOB_GC_GRACE`.
+pub const DEFAULT_BLOB_GC_GRACE: Duration = Duration::from_hours(90 * 24);
 /// Bounded worker count for offline/online integrity hashing and decoding.
 pub const DEFAULT_INTEGRITY_SCAN_CONCURRENCY: usize = 4;
 /// Fixed buffer used by each integrity scan worker.
@@ -383,10 +387,8 @@ fn parse_duration(value: &str) -> Option<Duration> {
         (value, 60)
     } else if let Some(value) = value.strip_suffix('h') {
         (value, 60 * 60)
-    } else if let Some(value) = value.strip_suffix('d') {
-        (value, 24 * 60 * 60)
     } else {
-        return None;
+        (value.strip_suffix('d')?, 24 * 60 * 60)
     };
     number
         .parse::<u64>()
@@ -422,7 +424,7 @@ mod tests {
         assert_eq!(config.max_snapshot_stored_bytes, 4 * 1024 * 1024 * 1024);
         assert_eq!(config.upload_expiry, Duration::from_hours(24));
         assert!(!config.admin_deletion_enabled);
-        assert_eq!(config.blob_gc_grace, Duration::from_hours(7 * 24));
+        assert_eq!(config.blob_gc_grace, Duration::from_hours(90 * 24));
         assert_eq!(config.integrity_scan_concurrency, 4);
         assert_eq!(config.integrity_scan_buffer_bytes, 64 * 1024);
     }
