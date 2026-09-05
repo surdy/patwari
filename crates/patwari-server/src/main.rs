@@ -9,6 +9,31 @@ use patwari_server::{
 };
 use tracing_subscriber::{EnvFilter, fmt};
 
+/// The usage block printed for `--help` and after the machine-readable error on an unrecognized
+/// command.
+///
+/// It is deliberately plain text rather than a generated clap surface: the accepted argument forms
+/// are matched positionally and exactly (below), so the usage text and the matcher are one small
+/// pair that a reader can check against each other in a single screen.
+const USAGE: &str = "\
+patwari-server — a self-hosted archive for complete coding-agent sessions.
+
+Usage: patwari-server [COMMAND]
+
+Commands:
+  serve                                     Run the HTTP archive service (the default with no arguments)
+  verify                                    Run the full integrity scan without listening; write one JSON report to stdout
+  backup create --output <dir>              Take a consistent online backup into a new directory outside the data dir
+  backup verify <dir>                       Check a backup directory's manifest, checksums, and a staged integrity scan
+  backup restore <dir> --data-dir <dir>     Restore a verified backup into an empty data directory
+
+Options:
+  -h, --help                                Print this usage and exit
+      --version                             Print the version and exit
+
+Every command is configured entirely through PATWARI_* environment variables; see docs/api.md
+for the full table and docs/self-hosting.md for the operator runbooks.";
+
 #[tokio::main]
 async fn main() {
     fmt()
@@ -21,6 +46,14 @@ async fn main() {
     match arguments.as_slice() {
         [] => {}
         [command] if command == "serve" => {}
+        [command] if command == "--help" || command == "-h" || command == "help" => {
+            println!("{USAGE}");
+            return;
+        }
+        [command] if command == "--version" => {
+            println!("patwari-server {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
         [command] if command == "verify" => {
             verify().await;
             return;
@@ -43,7 +76,10 @@ async fn main() {
         }
         _ => {
             tracing::error!("unknown archive command");
+            // The JSON line stays first on stdout and the exit code stays 2, so a script that
+            // parses `error_code` is unaffected; the usage goes to stderr, after it, for a person.
             print_machine_error("invalid_command");
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     }
