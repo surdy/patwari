@@ -10,9 +10,8 @@ in [`docs/domain.md`](domain.md). Everything here assumes the trust posture in t
 
 ## Command-line interface
 
-The `patwari-server` binary has **no `--help` and no usage output**. It matches a fixed set of
-positional argument forms exactly; anything else logs `unknown archive command`, prints
-`invalid_command`, and exits `2`. The accepted forms are:
+The `patwari-server` binary matches a fixed set of positional argument forms exactly — there is no
+option parser and no abbreviation. The accepted forms are:
 
 ```text
 patwari-server                       # same as serve
@@ -21,10 +20,21 @@ patwari-server verify
 patwari-server backup create --output <backup-dir>
 patwari-server backup verify <backup-dir>
 patwari-server backup restore <backup-dir> --data-dir <empty-data-dir>
+patwari-server --help                # also -h, or help
+patwari-server --version
 ```
 
+`--help`, `-h`, and `help` print the usage block to **stdout** and exit `0`; `--version` prints
+`patwari-server <version>` to stdout and exits `0`.
+
+Anything else logs `unknown archive command`, prints `{"error_code":"invalid_command"}` to stdout,
+prints the same usage block to **stderr after it**, and exits `2`. The JSON line stays first on
+stdout and the exit code stays `2`, so a script that parses `error_code` is unaffected by the
+usage text.
+
 Every command reads its configuration from the environment (below). Backup and restore procedure,
-scheduling, and the durability boundary are in [`docs/self-hosting.md`](self-hosting.md).
+scheduling, and the durability boundary are in [`docs/self-hosting.md`](self-hosting.md);
+`verify`, `backup`, and the CLI's own error codes are covered there too.
 
 ## Configuration
 
@@ -137,8 +147,9 @@ chunk indexes 0–7 with the least-significant bit representing index 0. Each `P
 `Content-Type: application/octet-stream`, `X-Patwari-Chunk-Length`, and
 `X-Patwari-Chunk-SHA256` (`sha256:` plus 64 lowercase hex digits). The server derives the only
 valid length for each index, including the final chunk. For practical compatibility, a headerless
-`chunks/0` request is accepted only when the negotiated artifact has exactly one chunk; its
-canonical manifest supplies the equivalent persisted length and checksum contract.
+`chunks/0` request is accepted only when the whole upload is a single artifact of exactly one
+chunk; its canonical manifest supplies the equivalent persisted length and checksum contract. Any
+multi-artifact upload always sends the headers.
 
 ### Verified artifact content
 

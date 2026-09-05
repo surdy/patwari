@@ -15,8 +15,10 @@ them, and submits an immutable proposed manifest plus stored artifact bytes to P
 verifies those bytes, gives them permanent identity, and hands them back on request — it never
 interprets what is inside them. [Qanungo](https://github.com/surdy/qanungo) is the read-side
 consumer: it pages the archive through this API, mines the transcripts, and reports on how the
-sessions actually went. Notesmith remains the home for human-readable summaries; a Notesmith summary
-may reference its Patwari session ID when full context is needed.
+sessions actually went — [`docs/consumers.md`](docs/consumers.md) is that read contract written
+down, for Qanungo or for anything else you point at the archive. Notesmith remains the home for
+human-readable summaries; a Notesmith summary may reference its Patwari session ID when full
+context is needed.
 
 **Start at [daftar](https://github.com/surdy/daftar)** — the suite front door: what the three tools
 are, install order, and a first end-to-end run.
@@ -71,7 +73,8 @@ A Munshi installation then registers its client UUID, creates an upload for one 
 `capture_id` and canonical manifest, receives a server-assigned chunk size, streams resumable
 stored-byte chunks for every declared artifact, completes verification of the complete set, and then
 fetches the immutable snapshot, capture provenance, or an individual stored artifact. Every route,
-header, and limit in that exchange is specified in [`docs/api.md`](docs/api.md).
+header, and limit in that exchange is specified in [`docs/api.md`](docs/api.md), and
+[`docs/ingest.md`](docs/ingest.md) walks the whole exchange with `curl` against a local server.
 
 For a real deployment — building the image, the volume layout, network posture, backups, restore,
 and blob GC — see [`docs/self-hosting.md`](docs/self-hosting.md).
@@ -83,6 +86,8 @@ and blob GC — see [`docs/self-hosting.md`](docs/self-hosting.md).
 | [`CONTEXT.md`](CONTEXT.md) | The canonical domain vocabulary. Read this before the others. |
 | [`docs/self-hosting.md`](docs/self-hosting.md) | Running it: image, volume, configuration, network posture, backups, restore, GC, updates. |
 | [`docs/api.md`](docs/api.md) | The HTTP API and CLI reference: endpoints, upload protocol, pagination, content headers, configuration variables, storage layout. |
+| [`docs/ingest.md`](docs/ingest.md) | Getting bytes in: one worked `curl` upload end to end, plus idempotency, conflicts, and abandon. |
+| [`docs/consumers.md`](docs/consumers.md) | Reading the archive as a consumer: incremental discovery, picking the right snapshot, verified downloads, and the artifact-role convention. |
 | [`docs/domain.md`](docs/domain.md) | The domain model, product decisions, responsibility boundary, and the phased delivery plan with its exit criteria. |
 | [`docs/adr/`](docs/adr/) | Architectural decision records — the trade-offs and why they were made. |
 | [`patwari-handoff.md`](patwari-handoff.md) | Historical planning document (2026-07). The shipped system differs; kept for provenance. |
@@ -106,8 +111,6 @@ Known gaps, deliberately stated rather than promised:
 
 - **No OpenAPI document.** The checked-in [`docs/api.md`](docs/api.md) is the cross-repository
   contract for now.
-- **No `--help`.** The binary matches a fixed set of positional argument forms and prints no usage
-  text; the commands are listed in [`docs/api.md`](docs/api.md#command-line-interface).
 - **No local prune command in Munshi.** Patwari never deletes source files; the bar such a command
   would have to meet is written down in [`docs/domain.md`](docs/domain.md#local-cleanup-safety).
 - Retention beyond explicit administrative deletion, authentication, and non-SQLite backends remain
