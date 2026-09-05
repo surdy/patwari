@@ -1,5 +1,8 @@
 # Patwari planning handoff
 
+> Historical planning document (2026-07); the shipped system differs — see the
+> [README](README.md).
+
 Use this document to start a separate planning session for **Patwari**, the remote history and backup
 server paired with [Munshi](../README.md).
 
@@ -553,13 +556,13 @@ Known preferences:
 
 - Self-hosted deployment is likely.
 - Privacy and local control matter.
-- Notesmith already runs as a Podman Quadlet.
+- A sibling self-hosted service already runs as a container on the same host.
 - macOS and Linux clients are in scope.
 
 Questions for the planning session:
 
 - Is the first Patwari deployment single-user only?
-- Should it run beside Notesmith on quadhost?
+- Should it run beside the existing self-hosted services on the same host?
 - Is local filesystem storage sufficient initially?
 - Should artifact blobs live on local disk or NFS?
 - Is off-site replication required?
@@ -612,8 +615,8 @@ It should be private initially.
 Plan Patwari, the central session-history and backup server paired with Munshi.
 
 Start by reading:
-- /Users/surdy/repos/munshi/README.md
-- /Users/surdy/repos/munshi/docs/patwari-handoff.md
+- the Munshi README
+- the Patwari handoff document in the Munshi repository
 
 Patwari should receive versioned coding-agent session metadata, Markdown summary revisions, and
 eventually compressed full-session artifacts from Munshi. It must support idempotent and resumable

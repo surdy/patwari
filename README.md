@@ -11,6 +11,16 @@ proposed manifest plus stored artifact bytes to Patwari. Notesmith remains the h
 human-readable summaries. A Notesmith summary may reference its Patwari session ID when full context
 is needed.
 
+## Trust and authentication
+
+Patwari has no authentication and no authorisation. It was built as one
+person's private archive for their own LAN and tailnet, where every client that
+can reach the listener is trusted — and that is still exactly what it assumes.
+Run it only on a private network, or behind an authenticating boundary you
+provide yourself; never on the public internet. Anyone is welcome to take it
+and adapt it. See [`docs/self-hosting.md`](docs/self-hosting.md) for the
+network posture, backups, and recovery.
+
 ## Running the archive
 
 The service establishes a durable archive identity and archives complete multi-artifact snapshots. A
@@ -43,11 +53,11 @@ returns `503` otherwise.
 
 ## Deployment, backup, and recovery
 
-The production image is defined by [`Containerfile`](Containerfile), and the
-quadhost Quadlet template, immutable-image installer, and environment example
-live in [`deploy/quadhost/`](deploy/quadhost/). The host listener is
-deliberately restricted to `192.168.16.169:8787`; v1 has no authentication, so
-it must remain on a trusted LAN and never be published on `0.0.0.0`.
+The production image is defined by [`Containerfile`](Containerfile), and
+[`docs/self-hosting.md`](docs/self-hosting.md) covers building it, the volume
+layout, configuration, network posture, backups, and recovery. v1 has no
+authentication, so the listener must stay inside a private network boundary and
+must never be published on a publicly reachable address.
 
 Use the archive-only maintenance CLI for a consistent online backup:
 
@@ -69,9 +79,9 @@ identity, and scans again.
 The persistent archive volume and local backup directory are **not**
 disposable cache. External replication of verified finalized backup
 directories to independent storage is the durability boundary. See
-[`docs/operations/quadhost.md`](docs/operations/quadhost.md) for deployment,
-health checks, schedules, SELinux, update/rollback, trusted-network, and
-clean-host disaster-recovery procedures.
+[`docs/self-hosting.md`](docs/self-hosting.md) for deployment, health checks,
+backup schedules, update and rollback, network posture, and clean-host
+disaster-recovery procedures.
 
 Configuration is environment-based and bounded by default:
 
@@ -175,7 +185,7 @@ recorded in [`docs/adr/`](docs/adr/).
 | Artifact visibility | Server-readable compressed files |
 | Encryption | No application-level encryption initially |
 | Authentication | None initially; deployment must remain inside a trusted network boundary |
-| Initial deployment | Single-user Podman Quadlet on quadhost |
+| Initial deployment | Single-user container on a private network (see [`docs/self-hosting.md`](docs/self-hosting.md)) |
 | Metadata store | SQLite |
 | Blob store | Dedicated local filesystem volume |
 | Additional backups | Patwari creates verified archive-only backup sets; external filesystem replication is the durability boundary |
@@ -728,7 +738,7 @@ Patwari v1 has no application authentication. Therefore:
 
 - it must not be exposed directly to the public internet;
 - its listener is configurable and defaults to loopback;
-- quadhost deployment must place it behind the trusted LAN or an authenticated network boundary;
+- deployment must place it behind a private network or an authenticated network boundary;
 - administrative deletion endpoints remain disabled by default;
 - request bodies, artifact contents, and local paths are not written to normal logs;
 - size, count, concurrency, and request-duration limits are mandatory.
@@ -785,7 +795,7 @@ Recommended stack:
 - SHA-256 for manifests, chunks, and stored artifacts;
 - tracing with structured redacted logs;
 - utoipa or a checked-in OpenAPI document for the public contract;
-- Podman Quadlet for deployment.
+- a single OCI container image for deployment.
 
 Rust aligns with Munshi, supports bounded streaming well, and allows protocol fixtures and generated
 types to be shared through the OpenAPI contract without sharing internal models.
@@ -859,9 +869,9 @@ Exit criteria:
 - a dry-run accurately identifies reclaimable local bytes;
 - manual pruning refuses sessions without a verified complete snapshot.
 
-### Phase 5: Quadhost operations
+### Phase 5: Host operations
 
-- Add Quadlet units, dedicated volume, health checks, and resource limits.
+- Add container units, a dedicated volume, health checks, and resource limits.
 - Document trusted-network exposure.
 - Add online SQLite backup, blob inventory, restore, and full verification procedures.
 - Exercise filesystem-level backup and disaster recovery.
@@ -882,7 +892,7 @@ This phase does not add model execution or derived knowledge to Patwari itself.
 
 ## v1 completion definition
 
-Patwari v1 is complete when Munshi can archive a real Copilot CLI session to quadhost, resume an
+Patwari v1 is complete when Munshi can archive a real Copilot CLI session to the server, resume an
 interrupted upload, receive a verified immutable receipt, list and download the snapshot, reproduce
 all compressed files byte-for-byte, and safely preview manual removal of the original local files.
 
@@ -893,3 +903,7 @@ all compressed files byte-for-byte, and safely preview manual removal of the ori
 - Authentication if Patwari crosses the trusted network boundary.
 - Restore compatibility contracts for each coding agent.
 - PostgreSQL or object-storage backends if single-node operation becomes insufficient.
+
+## License
+
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.

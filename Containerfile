@@ -24,7 +24,7 @@ LABEL org.opencontainers.image.title="Patwari" \
       org.opencontainers.image.source="https://github.com/surdy/patwari" \
       org.opencontainers.image.version="0.1.0" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
