@@ -101,6 +101,9 @@ POST   /api/v1/uploads/{upload_id}/abandon
 POST   /api/v1/uploads/{upload_id}/complete
 GET    /api/v1/uploads/{upload_id}/capture
 
+GET    /api/v1/stats
+GET    /api/v1/clients
+
 GET    /api/v1/sessions
 GET    /api/v1/sessions/{session_id}
 GET    /api/v1/sessions/{session_id}/captures
@@ -250,6 +253,81 @@ records, and manifests, retaining only redacted audit facts: client/session IDs,
 ID, canonical manifest digest, declared sizes and chunk count, timestamps, terminal reason, and
 error code. They do not retain request bodies, paths, chunk checksums, manifest contents, or
 artifact content.
+
+### Inventory
+
+Two unpaginated read resources answer "how much is in the archive" and "which clients have written
+to it" without walking a collection 50 rows at a time.
+
+`GET /api/v1/stats` returns archive-wide totals as of the moment the query ran:
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-05T06:24:49.892048Z",
+  "archive_instance_id": "01a0703d-6348-7251-9d35-fdfa83ee8978",
+  "sessions": 1,
+  "snapshots": 1,
+  "captures": 1,
+  "artifacts": 1,
+  "blobs": 1,
+  "stored_bytes": 68,
+  "original_bytes": 68,
+  "blob_stored_bytes": 68,
+  "clients": 1,
+  "tombstones": 0,
+  "last_ingest_at": "2026-09-05T06:24:45.840285Z",
+  "oldest_activity_at": "2026-09-05T06:24:45.840285Z",
+  "newest_activity_at": "2026-09-05T06:24:45.840285Z"
+}
+```
+
+Every count is of **live** rows, so a tombstoned snapshot leaves `sessions`, `snapshots`,
+`captures`, and `artifacts` and is counted in `tombstones` instead. Two byte figures are reported
+because they answer different questions: `stored_bytes` and `original_bytes` are the sums of the
+same per-snapshot totals `GET /snapshots/{id}` returns, so a blob shared by several snapshots is
+counted once per snapshot, while `blob_stored_bytes` is the deduplicated size of the authoritative
+blob rows — what the blob store actually occupies. `blobs` counts those same rows, which survive a
+tombstone until blob GC collects them after grace. `last_ingest_at` is the newest live capture's
+server completion time; `oldest_activity_at` and `newest_activity_at` bound exactly the session
+activity time the `GET /sessions` `activity_from` / `activity_to` filters compare against, so a
+consumer can size a window before it asks for one. `schema_version` is the version of this
+document and is pinned the way a manifest schema version is.
+
+`GET /api/v1/clients` lists every registered client with the fields
+`PUT /api/v1/clients/{client_id}` stored:
+
+```json
+{
+  "items": [
+    {
+      "client_id": "96c976cd-0025-47f6-bab1-5948d84ce11f",
+      "hostname": "workstation",
+      "display_name": "Workstation",
+      "first_seen_at": "2026-09-05T06:24:36.616757Z",
+      "last_seen_at": "2026-09-05T06:24:36.616757Z",
+      "capture_count": 1,
+      "last_capture_at": "2026-09-05T06:24:45.840285Z"
+    }
+  ],
+  "next_cursor": null,
+  "high_watermark": null
+}
+```
+
+`first_seen_at` and `last_seen_at` are that registration's creation and last update, so
+`last_seen_at` moves only when a client re-registers; `last_capture_at` is the completion time of
+its newest live capture and is the stronger "is this machine still reporting" signal.
+`capture_count` counts that client's live captures. The client registry is bounded by the number
+of machines an owner runs, so this listing is deliberately unpaginated: `next_cursor` is always
+`null` and reserved for a future page boundary. Per-client `metadata` is not returned here — it is
+an opaque document, available from the registration response.
+
+Both routes sit outside `/api/v1/admin/*` and inside the maintenance gate: they need no
+`PATWARI_ADMIN_DELETION_ENABLED`, and they return `503 maintenance_in_progress` during a backup
+like every other read. Both stay inside the ADR 0001 boundary by construction — every field is a
+count, a byte total, a timestamp, or an identifier the archive already stores, and nothing is
+derived from artifact content.
 
 ### Administrative deletion and blob GC
 

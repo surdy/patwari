@@ -14,6 +14,7 @@ mod error;
 mod health;
 mod ingestion;
 mod integrity;
+mod inventory;
 mod maintenance;
 mod pagination;
 mod retrieval;

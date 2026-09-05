@@ -184,6 +184,10 @@ the process stays alive. API writes fail alongside it with `500 storage_error`.
 That split is deliberate: a full disk is an operator problem, not a crash, and
 restarting the process fixes nothing.
 
+`GET /api/v1/stats` says what the archive believes it holds — snapshot, capture, and blob counts
+plus `blob_stored_bytes`, the deduplicated size of the blob rows — which is the figure to compare
+against what the volume actually reports below.
+
 Find out what is actually using the volume. With any OCI runtime (substitute
 `docker` for `podman` throughout):
 

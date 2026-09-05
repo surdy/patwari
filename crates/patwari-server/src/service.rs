@@ -19,7 +19,7 @@ use tracing::Level;
 use crate::{
     config::{Config, ConfigError},
     database::{self},
-    deletion, health, ingestion, integrity, maintenance, retrieval,
+    deletion, health, ingestion, integrity, inventory, maintenance, retrieval,
     storage::StorageLayout,
 };
 
@@ -453,6 +453,8 @@ impl Service {
                 "/uploads/{upload_id}/capture",
                 get(retrieval::get_capture_by_upload),
             )
+            .route("/stats", get(inventory::get_stats))
+            .route("/clients", get(inventory::list_clients))
             .route("/sessions", get(retrieval::list_sessions))
             .route("/sessions/{session_id}", get(retrieval::get_session))
             .route(

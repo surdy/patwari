@@ -380,6 +380,59 @@ pub struct PaginatedResponse<T> {
     pub high_watermark: Option<PageHighWatermark>,
 }
 
+/// Archive-wide inventory counters.
+///
+/// Every field is a count, a byte total, a timestamp, or the archive
+/// identity: this document deliberately carries nothing derived from
+/// artifact content (ADR 0001). Counts cover live rows, so a tombstoned
+/// snapshot leaves `snapshots`, `sessions`, `captures`, and `artifacts` and
+/// is counted in `tombstones` instead.
+///
+/// `stored_bytes` and `original_bytes` are the sums of the same per-snapshot
+/// totals `SnapshotResponse` returns, so a blob shared by several snapshots
+/// is counted once per snapshot. `blob_stored_bytes` is the complementary
+/// deduplicated figure: the size of the authoritative blob rows, which is
+/// what the blob store actually occupies.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveStats {
+    pub schema_version: u16,
+    pub generated_at: String,
+    pub archive_instance_id: String,
+    pub sessions: u64,
+    pub snapshots: u64,
+    pub captures: u64,
+    pub artifacts: u64,
+    pub blobs: u64,
+    pub stored_bytes: u64,
+    pub original_bytes: u64,
+    pub blob_stored_bytes: u64,
+    pub clients: u64,
+    pub tombstones: u64,
+    /// Server completion time of the newest live capture.
+    pub last_ingest_at: Option<String>,
+    /// Bounds of the same session activity time the `GET /sessions`
+    /// `activity_from` / `activity_to` filters compare against.
+    pub oldest_activity_at: Option<String>,
+    pub newest_activity_at: Option<String>,
+}
+
+/// One registered client, with the identity fields
+/// `PUT /clients/{client_id}` stores and its live capture count.
+///
+/// `first_seen_at` and `last_seen_at` are that registration's creation and
+/// last update; `last_capture_at` is the completion time of its newest live
+/// capture, which is the stronger "is this machine still reporting" signal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInventoryEntry {
+    pub client_id: String,
+    pub hostname: Option<String>,
+    pub display_name: Option<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: Option<String>,
+    pub capture_count: u64,
+    pub last_capture_at: Option<String>,
+}
+
 /// Immutable context from the latest completed snapshot projected onto a
 /// session for archive browsing. It does not replace historical capture or
 /// snapshot context.

@@ -18,11 +18,12 @@ use crate::{
     ReconciliationError, Service,
     config::Config,
     contract::{
-        Artifact, ArtifactMetadataResponse, BlobGcResponse, CanonicalManifestResponse,
-        CanonicalManifestSummary, CaptureProvenance, CompletionResponse, Compression,
-        IntegrityFindingKind, IntegrityRunStatus, Manifest, ManifestInput, PaginatedResponse,
-        Receipt, SessionInput, SessionResponse, SnapshotCapturesResponse, SnapshotResponse,
-        SnapshotSummary, TombstoneResponse, UploadResponse, UploadStatus, UploadStatusResponse,
+        ArchiveStats, Artifact, ArtifactMetadataResponse, BlobGcResponse,
+        CanonicalManifestResponse, CanonicalManifestSummary, CaptureProvenance,
+        ClientInventoryEntry, CompletionResponse, Compression, IntegrityFindingKind,
+        IntegrityRunStatus, Manifest, ManifestInput, PaginatedResponse, Receipt, SessionInput,
+        SessionResponse, SnapshotCapturesResponse, SnapshotResponse, SnapshotSummary,
+        TombstoneResponse, UploadResponse, UploadStatus, UploadStatusResponse,
     },
 };
 
@@ -6438,4 +6439,243 @@ async fn claude_code_sessions_ingest_and_filter_like_any_source_agent() {
     )
     .await;
     assert!(copilot_sessions.items.is_empty());
+}
+
+async fn fetch_stats(service: &Service, config: &Config) -> ArchiveStats {
+    get_json(service, config, "/api/v1/stats").await
+}
+
+async fn fetch_client_inventory(
+    service: &Service,
+    config: &Config,
+) -> PaginatedResponse<ClientInventoryEntry> {
+    get_json(service, config, "/api/v1/clients").await
+}
+
+#[tokio::test]
+async fn inventory_of_an_empty_archive_is_zeros_and_nulls() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, identity) = Service::bootstrap(&config).await.expect("bootstraps");
+
+    let stats = fetch_stats(&service, &config).await;
+    assert_eq!(stats.schema_version, 1);
+    assert_eq!(stats.archive_instance_id, identity.archive_instance_id);
+    assert_eq!(
+        (
+            stats.sessions,
+            stats.snapshots,
+            stats.captures,
+            stats.artifacts,
+            stats.blobs,
+            stats.clients,
+            stats.tombstones
+        ),
+        (0, 0, 0, 0, 0, 0, 0)
+    );
+    assert_eq!(
+        (
+            stats.stored_bytes,
+            stats.original_bytes,
+            stats.blob_stored_bytes
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(stats.last_ingest_at, None);
+    assert_eq!(stats.oldest_activity_at, None);
+    assert_eq!(stats.newest_activity_at, None);
+    // An empty archive still reports when it was asked, so a consumer can
+    // tell "nothing yet" from a stale cached document.
+    assert!(!stats.generated_at.is_empty());
+
+    let clients = fetch_client_inventory(&service, &config).await;
+    assert!(clients.items.is_empty());
+    assert_eq!(clients.next_cursor, None);
+}
+
+#[tokio::test]
+async fn inventory_counts_one_uploaded_snapshot_and_attributes_it_to_its_client() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, identity) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let bytes = b"inventory source event\n".repeat(8);
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "inventory-capture",
+        manifest(&bytes, &bytes, Compression::Identity),
+        &bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+    let snapshot = fetch_snapshot(&service, &config, &completion.receipt.snapshot_id).await;
+    let capture: CaptureProvenance = get_json(
+        &service,
+        &config,
+        format!("/api/v1/uploads/{}/capture", upload.upload_id),
+    )
+    .await;
+    let session: SessionResponse = get_json(
+        &service,
+        &config,
+        format!("/api/v1/sessions/{}", snapshot.session_id),
+    )
+    .await;
+
+    let stats = fetch_stats(&service, &config).await;
+    assert_eq!(stats.archive_instance_id, identity.archive_instance_id);
+    assert_eq!(
+        (
+            stats.sessions,
+            stats.snapshots,
+            stats.captures,
+            stats.artifacts,
+            stats.blobs,
+            stats.clients,
+            stats.tombstones
+        ),
+        (1, 1, 1, 1, 1, 1, 0)
+    );
+    // The archive-wide byte totals are the sums of exactly the per-snapshot
+    // totals the snapshot resource already returns.
+    assert_eq!(stats.stored_bytes, snapshot.total_stored_bytes);
+    assert_eq!(stats.original_bytes, snapshot.total_original_bytes);
+    assert_eq!(stats.stored_bytes, bytes.len() as u64);
+    assert_eq!(stats.blob_stored_bytes, stats.stored_bytes);
+    assert_eq!(
+        stats.last_ingest_at.as_deref(),
+        Some(capture.server_completed_at.as_str())
+    );
+    assert_eq!(
+        stats.oldest_activity_at.as_deref(),
+        Some(session.latest_snapshot.completed_at.as_str())
+    );
+    assert_eq!(stats.newest_activity_at, stats.oldest_activity_at);
+
+    let clients = fetch_client_inventory(&service, &config).await;
+    assert_eq!(clients.next_cursor, None);
+    assert_eq!(clients.items.len(), 1);
+    let entry = &clients.items[0];
+    assert_eq!(entry.client_id, client_id.to_string());
+    assert_eq!(entry.hostname.as_deref(), Some("developer-host"));
+    assert_eq!(entry.display_name.as_deref(), Some("Developer"));
+    assert_eq!(entry.capture_count, 1);
+    assert_eq!(
+        entry.last_seen_at.as_deref(),
+        Some(entry.first_seen_at.as_str())
+    );
+    assert_eq!(
+        entry.last_capture_at.as_deref(),
+        Some(capture.server_completed_at.as_str())
+    );
+}
+
+#[tokio::test]
+async fn tombstoning_moves_a_snapshot_out_of_the_counts_and_into_tombstones() {
+    let data_dir = TestDataDir::new();
+    let mut config = test_config(&data_dir);
+    config.admin_deletion_enabled = true;
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let client_id = Uuid::new_v4();
+    register(service.router(&config), client_id).await;
+
+    let bytes = b"tombstoned inventory event\n".repeat(4);
+    let upload = upload_full(
+        &service,
+        &config,
+        client_id,
+        "inventory-tombstone",
+        manifest(&bytes, &bytes, Compression::Identity),
+        &bytes,
+    )
+    .await;
+    let completion =
+        complete_upload_for_completion(&service, &config, &upload.completion_url).await;
+
+    let before = fetch_stats(&service, &config).await;
+    assert_eq!((before.snapshots, before.tombstones), (1, 0));
+
+    let (status, _) = delete_snapshot(
+        &service,
+        &config,
+        &completion.receipt.snapshot_id,
+        &completion.receipt.snapshot_fingerprint,
+        Some("inventory test"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after = fetch_stats(&service, &config).await;
+    assert_eq!((after.snapshots, after.tombstones), (0, 1));
+    assert_eq!(
+        (
+            after.sessions,
+            after.captures,
+            after.artifacts,
+            after.stored_bytes,
+            after.original_bytes
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    // The blob row survives a tombstone until blob GC collects it, so the
+    // deduplicated figure still reports the bytes on disk.
+    assert_eq!(after.blobs, 1);
+    assert_eq!(after.blob_stored_bytes, before.blob_stored_bytes);
+    assert_eq!(after.last_ingest_at, None);
+    assert_eq!(after.newest_activity_at, None);
+    assert_eq!(after.clients, 1);
+
+    let clients = fetch_client_inventory(&service, &config).await;
+    assert_eq!(clients.items.len(), 1);
+    assert_eq!(clients.items[0].capture_count, 0);
+    assert_eq!(clients.items[0].last_capture_at, None);
+}
+
+#[tokio::test]
+async fn inventory_reads_are_paused_by_an_archive_maintenance_lease() {
+    let data_dir = TestDataDir::new();
+    let config = test_config(&data_dir);
+    let (service, _) = Service::bootstrap(&config).await.expect("bootstraps");
+    let permit = crate::maintenance::ExclusivePermit::acquire(
+        &service.state.database,
+        service.state.storage.maintenance_dir(),
+    )
+    .await
+    .expect("maintenance lease acquires");
+
+    for uri in ["/api/v1/stats", "/api/v1/clients"] {
+        let (status, _, body) = call(
+            service.router(&config),
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request is valid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        assert!(
+            String::from_utf8(body)
+                .expect("response is UTF-8")
+                .contains("maintenance_in_progress"),
+            "{uri}"
+        );
+    }
+
+    permit.release().await.expect("maintenance lease releases");
+    for uri in ["/api/v1/stats", "/api/v1/clients"] {
+        let (status, _, _) = call(
+            service.router(&config),
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request is valid"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
 }

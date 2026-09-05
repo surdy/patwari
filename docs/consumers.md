@@ -36,6 +36,21 @@ every slot and starves the archive's other clients. A read-side client that *ret
 archive turns a slow server into an unavailable one, so Qanungo does not retry at all: a session
 that fails is recorded as a skip and named in the report.
 
+## How much is in the archive
+
+Before mirroring a window, ask what the window can contain. `GET /api/v1/stats` returns the whole
+archive as integers and timestamps in one request — `sessions`, `snapshots`, `captures`,
+`artifacts`, `blobs`, `clients`, `tombstones`, the stored and original byte totals, `last_ingest_at`,
+and `oldest_activity_at` / `newest_activity_at`. Those two bounds are the **same** session activity
+time `activity_from` and `activity_to` filter on, so they tell a consumer the real extent of the
+archive before it picks a window, and a window that starts before `oldest_activity_at` will not
+find anything older. `GET /api/v1/clients` is its companion: every registered client with its
+`hostname`, `capture_count`, and `last_capture_at`, which is how a reader answers "are all my
+machines still reporting" without inferring it from its own mirror. Neither route paginates,
+neither needs the admin surface, and both are cheap enough to call on every refresh — but neither
+is a substitute for the cursors below: they are a snapshot of totals, not a traversal. Both are
+documented in full in [`docs/api.md`](api.md#inventory).
+
 ## Discovering sessions incrementally
 
 `GET /api/v1/sessions` lists **only sessions that have a visible completed snapshot**, and projects
