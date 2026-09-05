@@ -49,7 +49,7 @@ backup staging and replication targets too.
 
 Configuration is entirely `PATWARI_*` environment variables. The full table of
 variables, defaults, and bounds is in the
-[README](../README.md#deployment-backup-and-recovery). The ones that matter on
+[API and CLI reference](api.md#configuration). The ones that matter on
 a first deployment are `PATWARI_DATA_DIR` (above), `PATWARI_BIND_ADDR`
 (defaults to `127.0.0.1:8080`), `PATWARI_ADMIN_DELETION_ENABLED` (`false`), and
 `PATWARI_BLOB_GC_GRACE` (`90d`).
